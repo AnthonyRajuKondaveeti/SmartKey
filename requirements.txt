@@ -1,0 +1,10 @@
+pynput==1.8.1
+pyperclip==1.11.0
+PyAutoGUI==0.9.54
+PyQt5==5.15.11
+pystray==0.19.5
+
+# Week 2 — AI libraries (install when needed)
+# onnxruntime==1.18.0
+# transformers==4.41.0
+# optimum==1.19.0

@@ -1,0 +1,19 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+
+# Model files (large — download separately)
+models/indictrans2/*.onnx
+models/tone_model/*.onnx
+models/grammar_model/*.onnx
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
