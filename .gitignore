@@ -5,10 +5,15 @@ __pycache__/
 *.pyd
 .env
 
-# Model files (large — download separately)
-models/indictrans2/*.onnx
-models/tone_model/*.onnx
-models/grammar_model/*.onnx
+# Model files (large — download separately via Colab notebooks)
+models/*
+!models/.gitkeep
+
+# Runtime logs
+logs/
+
+# Claude Code memory
+.claude/
 
 # OS
 .DS_Store

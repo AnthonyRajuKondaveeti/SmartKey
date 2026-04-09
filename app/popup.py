@@ -1,384 +1,306 @@
-"""
-popup.py
---------
-Floating always-on-top popup window for the Smart Desktop Keyboard.
-
-Features:
-  - Mode toggle: Hindi Translation / English Grammar
-  - Relationship chips: Mother / Friend / Partner / Stranger
-  - Input preview (the captured selected text)
-  - Process button → calls AI engine (placeholder in Week 1)
-  - Output preview
-  - Paste button → injects result into active app
-  - Escape or click-outside to close
-  - Appears near the mouse cursor
-"""
-
 import sys
+import time
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QTextEdit, QButtonGroup,
-    QFrame, QSizePolicy
+    QPushButton, QLabel, QTextEdit, QFrame, QGraphicsDropShadowEffect
 )
-from PyQt5.QtCore import Qt, QPoint, QTimer
-from PyQt5.QtGui import QFont, QColor, QPalette, QCursor
+from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QFont, QCursor, QColor
+from logger import log
 
-
-# ── Colour palette ────────────────────────────────────────────────────────────
-BG_COLOR       = "#1E1E2E"   # Dark background
-SURFACE_COLOR  = "#2A2A3E"   # Card / section backgrounds
-ACCENT_COLOR   = "#7C6AF7"   # Purple accent (active state)
-TEXT_PRIMARY   = "#E0E0F0"   # Main text
-TEXT_SECONDARY = "#9090B0"   # Dimmed text
-SUCCESS_COLOR  = "#4CAF88"   # Paste button green
-CHIP_BG        = "#3A3A52"   # Inactive relationship chip
-BORDER_COLOR   = "#3E3E58"   # Subtle borders
-
-RELATIONSHIPS = ["Mother", "Friend", "Partner", "Stranger"]
-MODES         = ["🇮🇳  Hindi Translation", "📝  Grammar Polish"]
-
+# ── Minimalist Sand Palette ──────────────────────────────────────────────────
+BG_COLOR        = "#FBFBFB"   # Paper White
+SURFACE_COLOR   = "#FFFFFF"   # Pure White
+CHIP_COLOR      = "#F4F4F3"   # Soft Sand / Light Tan
+ACCENT_BLACK    = "#1A1A1A"   # Deep Charcoal Black
+TEXT_MAIN       = "#37352F"   # Warm Dark Gray (Notion Style)
+TEXT_MUTED      = "#807D78"   # Muted Warm Gray
+BORDER_COLOR    = "#E8E8E8"   # Minimal soft border
+SUCCESS_SAND    = "#435B4E"   # Muted Forest Green (matches the warm theme)
 
 class SmartKeyboardPopup(QWidget):
-    """
-    The main floating popup.
-
-    Usage:
-        popup = SmartKeyboardPopup(selected_text="Hello world", on_paste=my_fn)
-        popup.show_near_cursor()
-    """
-
-    def __init__(self, selected_text: str = "", on_paste=None, on_close=None):
+    def __init__(self, selected_text: str = "", on_paste=None):
         super().__init__()
-
         self._selected_text = selected_text
-        self._on_paste       = on_paste    # Callable[[str], None] — called when Paste is clicked
-        self._on_close       = on_close    # Callable[]  — called on close
-
-        self._current_mode         = 0    # 0 = Hindi Translation, 1 = Grammar Polish
-        self._current_relationship = 0    # index into RELATIONSHIPS
+        self._on_paste = on_paste
+        self._translation_enabled = False
+        self._current_relationship = 0
+        self._processing = False
+        self._translation_engine = None
+        self._grammar_engine = None
+        self._process_start_time = 0.0
 
         self._build_ui()
         self._apply_styles()
+        self._add_shadow()
 
-    # ── UI construction ───────────────────────────────────────────────────────
+    def set_translation_engine(self, engine): self._translation_engine = engine
+    def set_grammar_engine(self, engine): self._grammar_engine = engine
 
     def _build_ui(self):
-        self.setWindowTitle("Smart Keyboard")
-        self.setWindowFlags(
-            Qt.FramelessWindowHint |
-            Qt.WindowStaysOnTopHint |
-            Qt.Tool               # Keeps it out of the taskbar
-        )
-        self.setAttribute(Qt.WA_TranslucentBackground, False)
-        self.setFixedWidth(420)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setFixedWidth(440)
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(16, 14, 16, 14)
-        root.setSpacing(10)
+        # Main Outer Container
+        self.container = QWidget(self)
+        self.container.setObjectName("MainContainer")
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(12, 12, 12, 12)
+        main_layout.addWidget(self.container)
 
-        # ── Title bar ────────────────────────────────────────────────────────
-        title_bar = QHBoxLayout()
-        title_lbl = QLabel("⌨  Smart Keyboard")
-        title_lbl.setFont(QFont("Segoe UI", 11, QFont.Bold))
-        title_lbl.setStyleSheet(f"color: {TEXT_PRIMARY};")
+        layout = QVBoxLayout(self.container)
+        layout.setContentsMargins(28, 24, 28, 24)
+        layout.setSpacing(18)
 
+        # ── Header ────────────────────────────────────────────────────────────
+        header = QHBoxLayout()
+        title_label = QLabel("SMART KEYBOARD")
+        title_label.setFont(QFont("Inter", 9, QFont.Black))
+        title_label.setStyleSheet(f"color: {ACCENT_BLACK}; letter-spacing: 2px;")
+        
         close_btn = QPushButton("✕")
-        close_btn.setFixedSize(24, 24)
-        close_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: transparent;
-                color: {TEXT_SECONDARY};
-                border: none;
-                font-size: 13px;
-            }}
-            QPushButton:hover {{ color: #FF6B6B; }}
-        """)
+        close_btn.setFixedSize(20, 20)
+        close_btn.setCursor(Qt.PointingHandCursor)
         close_btn.clicked.connect(self.close)
+        close_btn.setStyleSheet(f"QPushButton {{ background: transparent; color: {TEXT_MUTED}; border: none; font-size: 12px; }} QPushButton:hover {{ color: {ACCENT_BLACK}; }}")
 
-        title_bar.addWidget(title_lbl)
-        title_bar.addStretch()
-        title_bar.addWidget(close_btn)
-        root.addLayout(title_bar)
+        header.addWidget(title_label)
+        header.addStretch()
+        header.addWidget(close_btn)
+        layout.addLayout(header)
 
-        root.addWidget(self._hline())
+        # ── Pipeline / Modes ──────────────────────────────────────────────────
+        mode_container = QHBoxLayout()
+        mode_container.setSpacing(10)
 
-        # ── Mode toggle ───────────────────────────────────────────────────────
-        mode_lbl = QLabel("Mode")
-        mode_lbl.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 10px;")
-        root.addWidget(mode_lbl)
+        self._grammar_btn = QPushButton("English Refiner")
+        self._grammar_btn.setFixedHeight(36)
+        
+        self._translation_btn = QPushButton("Hindi Translate")
+        self._translation_btn.setCheckable(True)
+        self._translation_btn.setFixedHeight(36)
+        self._translation_btn.setCursor(Qt.PointingHandCursor)
+        self._translation_btn.clicked.connect(self._on_translation_toggle)
 
-        mode_row = QHBoxLayout()
-        mode_row.setSpacing(8)
-        self._mode_buttons = []
-        self._mode_group   = QButtonGroup(self)
+        mode_container.addWidget(self._grammar_btn, 1)
+        mode_container.addWidget(self._translation_btn, 1)
+        layout.addLayout(mode_container)
 
-        for i, label in enumerate(MODES):
-            btn = QPushButton(label)
-            btn.setCheckable(True)
-            btn.setChecked(i == 0)
-            btn.setFixedHeight(34)
-            btn.clicked.connect(lambda _, idx=i: self._set_mode(idx))
-            self._mode_group.addButton(btn, i)
-            self._mode_buttons.append(btn)
-            mode_row.addWidget(btn)
-
-        root.addLayout(mode_row)
-
-        # ── Relationship chips ────────────────────────────────────────────────
-        rel_lbl = QLabel("Tone / Relationship")
-        rel_lbl.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 10px;")
-        root.addWidget(rel_lbl)
-
-        rel_row = QHBoxLayout()
-        rel_row.setSpacing(6)
+        # ── Relationship Chips ────────────────────────────────────────────────
+        self._rel_group = QWidget()
+        self._rel_group.setVisible(False)
+        rel_layout = QVBoxLayout(self._rel_group)
+        rel_layout.setContentsMargins(0, 0, 0, 0)
+        
+        rel_layout.addWidget(self._section_label("CONTEXT"))
+        chips_layout = QHBoxLayout()
+        chips_layout.setSpacing(8)
         self._rel_buttons = []
-
-        for i, name in enumerate(RELATIONSHIPS):
+        for i, name in enumerate(["Mother", "Friend", "Partner", "Stranger"]):
             btn = QPushButton(name)
             btn.setCheckable(True)
             btn.setChecked(i == 0)
-            btn.setFixedHeight(30)
+            btn.setFixedHeight(28)
+            btn.setCursor(Qt.PointingHandCursor)
             btn.clicked.connect(lambda _, idx=i: self._set_relationship(idx))
             self._rel_buttons.append(btn)
-            rel_row.addWidget(btn)
+            chips_layout.addWidget(btn)
+        rel_layout.addLayout(chips_layout)
+        layout.addWidget(self._rel_group)
 
-        root.addLayout(rel_row)
-
-        root.addWidget(self._hline())
-
-        # ── Input preview ─────────────────────────────────────────────────────
-        in_lbl = QLabel("Selected text")
-        in_lbl.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 10px;")
-        root.addWidget(in_lbl)
-
+        # ── Input Area ────────────────────────────────────────────────────────
+        layout.addWidget(self._section_label("INPUT"))
         self._input_box = QTextEdit()
         self._input_box.setPlainText(self._selected_text)
-        self._input_box.setFixedHeight(72)
-        self._input_box.setReadOnly(False)   # User can edit before processing
-        root.addWidget(self._input_box)
+        self._input_box.setFixedHeight(80)
+        layout.addWidget(self._input_box)
 
-        # ── Process button ────────────────────────────────────────────────────
-        self._process_btn = QPushButton("⚡  Process")
-        self._process_btn.setFixedHeight(38)
+        # ── Action Button ─────────────────────────────────────────────────────
+        self._process_btn = QPushButton("PROCESS")
+        self._process_btn.setFixedHeight(40)
+        self._process_btn.setCursor(Qt.PointingHandCursor)
         self._process_btn.clicked.connect(self._on_process)
-        root.addWidget(self._process_btn)
+        layout.addWidget(self._process_btn)
 
-        # ── Output preview ────────────────────────────────────────────────────
-        out_lbl = QLabel("Result")
-        out_lbl.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 10px;")
-        root.addWidget(out_lbl)
-
+        # ── Output Area ───────────────────────────────────────────────────────
+        layout.addWidget(self._section_label("OUTPUT"))
         self._output_box = QTextEdit()
-        self._output_box.setPlaceholderText("Processed output will appear here…")
-        self._output_box.setFixedHeight(72)
+        self._output_box.setPlaceholderText("Refined text will appear here...")
+        self._output_box.setFixedHeight(80)
         self._output_box.setReadOnly(True)
-        root.addWidget(self._output_box)
+        layout.addWidget(self._output_box)
 
-        # ── Paste button ──────────────────────────────────────────────────────
-        self._paste_btn = QPushButton("📋  Paste into App")
-        self._paste_btn.setFixedHeight(38)
+        # ── Footer Action ─────────────────────────────────────────────────────
+        self._paste_btn = QPushButton("Paste to Application")
+        self._paste_btn.setFixedHeight(40)
         self._paste_btn.setEnabled(False)
+        self._paste_btn.setCursor(Qt.PointingHandCursor)
         self._paste_btn.clicked.connect(self._on_paste_clicked)
-        root.addWidget(self._paste_btn)
+        layout.addWidget(self._paste_btn)
 
-        # ── Keyboard shortcut hints ───────────────────────────────────────────
-        hint = QLabel("Enter: Process  •  Ctrl+Enter: Paste  •  Esc: Close")
-        hint.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 9px;")
+        hint = QLabel("Enter · Process   |   Ctrl+Enter · Paste")
         hint.setAlignment(Qt.AlignCenter)
-        root.addWidget(hint)
+        hint.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 9px; text-transform: uppercase; letter-spacing: 1px;")
+        layout.addWidget(hint)
 
-        self.adjustSize()
+    def _section_label(self, text):
+        lbl = QLabel(text)
+        lbl.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 9px; font-weight: 800; letter-spacing: 1.2px;")
+        return lbl
 
-    def _hline(self) -> QFrame:
-        line = QFrame()
-        line.setFrameShape(QFrame.HLine)
-        line.setStyleSheet(f"color: {BORDER_COLOR};")
-        return line
-
-    # ── Styles ────────────────────────────────────────────────────────────────
+    def _add_shadow(self):
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(25)
+        shadow.setXOffset(0)
+        shadow.setYOffset(8)
+        shadow.setColor(QColor(0, 0, 0, 30))
+        self.container.setGraphicsEffect(shadow)
 
     def _apply_styles(self):
-        self.setStyleSheet(f"""
-            QWidget {{
+        self.container.setStyleSheet(f"""
+            #MainContainer {{
                 background-color: {BG_COLOR};
-                color: {TEXT_PRIMARY};
-                font-family: 'Segoe UI', 'Inter', sans-serif;
-                font-size: 12px;
+                border: 1px solid {BORDER_COLOR};
+                border-radius: 8px;
             }}
             QTextEdit {{
                 background-color: {SURFACE_COLOR};
-                color: {TEXT_PRIMARY};
+                color: {TEXT_MAIN};
                 border: 1px solid {BORDER_COLOR};
-                border-radius: 6px;
-                padding: 6px;
-                font-size: 12px;
+                border-radius: 4px;
+                padding: 10px;
+                font-size: 13px;
+                selection-background-color: {CHIP_COLOR};
+                selection-color: {ACCENT_BLACK};
+            }}
+            QTextEdit:focus {{
+                border: 1px solid {ACCENT_BLACK};
             }}
             QPushButton {{
-                background-color: {CHIP_BG};
-                color: {TEXT_PRIMARY};
+                background-color: {CHIP_COLOR};
+                color: {TEXT_MAIN};
                 border: 1px solid {BORDER_COLOR};
-                border-radius: 6px;
-                padding: 4px 10px;
-                font-size: 12px;
+                border-radius: 4px;
+                font-weight: 600;
+                font-size: 11px;
             }}
             QPushButton:hover {{
-                background-color: {SURFACE_COLOR};
-                border-color: {ACCENT_COLOR};
+                background-color: #EDECEB;
             }}
             QPushButton:checked {{
-                background-color: {ACCENT_COLOR};
-                border-color: {ACCENT_COLOR};
-                color: white;
-                font-weight: bold;
+                background-color: {ACCENT_BLACK};
+                color: {BG_COLOR};
+                border: 1px solid {ACCENT_BLACK};
             }}
         """)
 
-        # Process button — accent style
+        # Process Button - Solid Black
         self._process_btn.setStyleSheet(f"""
             QPushButton {{
-                background-color: {ACCENT_COLOR};
-                color: white;
-                border: none;
-                border-radius: 6px;
-                font-size: 13px;
-                font-weight: bold;
+                background-color: {ACCENT_BLACK}; color: {BG_COLOR};
+                border: none; border-radius: 4px; font-size: 11px; font-weight: 800; letter-spacing: 1px;
             }}
-            QPushButton:hover {{ background-color: #9580FF; }}
-            QPushButton:pressed {{ background-color: #6655DD; }}
+            QPushButton:hover {{ background-color: #333333; }}
+            QPushButton:disabled {{ background-color: {CHIP_COLOR}; color: {TEXT_MUTED}; }}
         """)
 
-        # Paste button — green style (disabled until output is ready)
+        # Paste Button - Muted Forest Green
         self._paste_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: #2A3E35;
-                color: {TEXT_SECONDARY};
-                border: 1px solid #3E5248;
-                border-radius: 6px;
-                font-size: 13px;
-            }}
             QPushButton:enabled {{
-                background-color: {SUCCESS_COLOR};
-                color: white;
-                font-weight: bold;
-                border: none;
+                background-color: {SUCCESS_SAND}; color: white;
+                border: none; border-radius: 4px; font-weight: 800;
             }}
-            QPushButton:enabled:hover {{ background-color: #5DBF9A; }}
+            QPushButton:disabled {{
+                background-color: {SURFACE_COLOR}; border: 1px solid {BORDER_COLOR}; color: {TEXT_MUTED};
+            }}
         """)
 
-    # ── Behaviour ─────────────────────────────────────────────────────────────
-
+    # ── Logic (Preserved) ─────────────────────────────────────────────────────
     def show_near_cursor(self):
-        """Position the popup close to the current mouse cursor, on screen."""
-        cursor_pos = QCursor.pos()
+        pos = QCursor.pos()
         screen = QApplication.primaryScreen().availableGeometry()
-
-        x = cursor_pos.x() + 20
-        y = cursor_pos.y() + 20
-
-        # Keep it on screen
-        if x + self.width()  > screen.right():
-            x = screen.right()  - self.width()  - 10
-        if y + self.height() > screen.bottom():
-            y = screen.bottom() - self.height() - 10
-
+        x, y = pos.x() + 20, pos.y() + 20
+        if x + self.width() > screen.right(): x = screen.right() - self.width() - 10
+        if y + self.height() > screen.bottom(): y = screen.bottom() - self.height() - 10
         self.move(x, y)
         self.show()
-        self.raise_()
-        self.activateWindow()
 
-    def set_selected_text(self, text: str):
-        self._selected_text = text
+    def set_selected_text(self, text):
         self._input_box.setPlainText(text)
         self._output_box.clear()
         self._paste_btn.setEnabled(False)
+        self._reset_process_btn()
 
-    def _set_mode(self, idx: int):
-        self._current_mode = idx
-        for i, btn in enumerate(self._mode_buttons):
-            btn.setChecked(i == idx)
-        # Show/hide relationship row — only relevant for Translation mode
-        visible = idx == 0
-        for btn in self._rel_buttons:
-            btn.setVisible(visible)
-
-    def _set_relationship(self, idx: int):
+    def _set_relationship(self, idx):
         self._current_relationship = idx
-        for i, btn in enumerate(self._rel_buttons):
-            btn.setChecked(i == idx)
+        for i, btn in enumerate(self._rel_buttons): btn.setChecked(i == idx)
+
+    def _on_translation_toggle(self):
+        self._translation_enabled = self._translation_btn.isChecked()
+        self._rel_group.setVisible(self._translation_enabled)
+        self.adjustSize()
 
     def _on_process(self):
-        """
-        Week 1: Return a placeholder so the full paste flow can be tested.
-        Week 2+: This will call TranslationEngine / GrammarEngine.
-        """
-        input_text = self._input_box.toPlainText().strip()
-        if not input_text:
-            self._output_box.setPlainText("⚠ Nothing to process — select some text first.")
-            return
+        if self._processing: return
+        text = self._input_box.toPlainText().strip()
+        if not text: return
+        self._processing = True
+        self._process_start_time = time.monotonic()
+        self._process_btn.setEnabled(False)
+        self._process_btn.setText("WORKING...")
+        if self._translation_enabled: self._run_translation(text)
+        else: self._run_grammar(text)
 
-        mode = MODES[self._current_mode]
-        rel  = RELATIONSHIPS[self._current_relationship]
+    def _run_translation(self, text):
+        if self._grammar_engine and self._grammar_engine.is_ready:
+            self._grammar_engine.correct(text, on_result=lambda c: self._do_translate(c or text), on_error=lambda e: self._do_translate(text))
+        else: self._do_translate(text)
 
-        # ── Placeholder output (replace in Week 2) ──
-        if self._current_mode == 0:
-            placeholder = (
-                f"[Hindi translation of: '{input_text[:40]}{'…' if len(input_text)>40 else ''}']\n"
-                f"Tone: {rel} — AI model not loaded yet (Week 2)"
-            )
-        else:
-            placeholder = (
-                f"[Grammar-polished: '{input_text[:40]}{'…' if len(input_text)>40 else ''}']\n"
-                f"AI model not loaded yet (Week 2)"
-            )
+    def _do_translate(self, text):
+        if self._translation_engine: self._translation_engine.translate(text=text, on_result=self._on_bg_result, on_error=self._on_bg_error)
 
-        self._output_box.setPlainText(placeholder)
-        self._paste_btn.setEnabled(True)
+    def _run_grammar(self, text):
+        if self._grammar_engine: self._grammar_engine.correct(text=text, on_result=self._on_bg_result, on_error=self._on_bg_error)
+
+    def _on_bg_result(self, output):
+        self._pending_output = output
+        QTimer.singleShot(0, self._flush_pending_output)
+
+    def _on_bg_error(self, message):
+        self._pending_output = f"Error: {message}"
+        QTimer.singleShot(0, self._flush_pending_output)
+
+    def _flush_pending_output(self):
+        out = getattr(self, "_pending_output", None)
+        if out:
+            self._output_box.setPlainText(out)
+            self._paste_btn.setEnabled(True)
+            self._reset_process_btn()
+            self._processing = False
+
+    def _reset_process_btn(self):
+        self._process_btn.setEnabled(True)
+        self._process_btn.setText("PROCESS")
 
     def _on_paste_clicked(self):
-        result = self._output_box.toPlainText()
-        if self._on_paste and result:
-            self.hide()                       # Hide popup before pasting
-            QTimer.singleShot(150, lambda: self._on_paste(result))
-        else:
-            self.close()
-
-    # ── Keyboard shortcuts ────────────────────────────────────────────────────
+        res = self._output_box.toPlainText()
+        if self._on_paste and res:
+            self.hide()
+            QTimer.singleShot(50, lambda: self._on_paste(res))
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Escape:
-            self.close()
-        elif event.key() == Qt.Key_Return and not (event.modifiers() & Qt.ControlModifier):
-            self._on_process()
-        elif event.key() == Qt.Key_Return and event.modifiers() & Qt.ControlModifier:
-            if self._paste_btn.isEnabled():
-                self._on_paste_clicked()
-
-    # ── Allow window dragging ─────────────────────────────────────────────────
+        if event.key() == Qt.Key_Escape: self.close()
+        elif event.key() == Qt.Key_Return and not (event.modifiers() & Qt.ControlModifier): self._on_process()
+        elif event.key() == Qt.Key_Return and (event.modifiers() & Qt.ControlModifier): self._on_paste_clicked()
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self._drag_pos = event.globalPos() - self.frameGeometry().topLeft()
-
+        if event.button() == Qt.LeftButton: self._drag_pos = event.globalPos() - self.frameGeometry().topLeft()
     def mouseMoveEvent(self, event):
-        if event.buttons() == Qt.LeftButton and hasattr(self, '_drag_pos'):
-            self.move(event.globalPos() - self._drag_pos)
+        if event.buttons() == Qt.LeftButton and hasattr(self, "_drag_pos"): self.move(event.globalPos() - self._drag_pos)
 
-    def closeEvent(self, event):
-        if self._on_close:
-            self._on_close()
-        super().closeEvent(event)
-
-
-# ── Standalone test ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-
-    def on_paste(text):
-        print(f"\n[PASTE TRIGGERED]\n{text}\n")
-
-    popup = SmartKeyboardPopup(
-        selected_text="Hello, I wanted to let you know that I will be late today.",
-        on_paste=on_paste,
-    )
-    popup.show_near_cursor()
+    window = SmartKeyboardPopup(selected_text="This minimalist sand theme is inspired by Notion.")
+    window.show_near_cursor()
     sys.exit(app.exec_())
