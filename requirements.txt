@@ -12,6 +12,7 @@ onnx==1.17.0
 transformers==4.41.0
 sentencepiece==0.2.0
 sacrebleu==2.4.2        # used in Colab validation only
+indic-transliteration   # pure Python — Devanagari→Telugu/other-script transliteration for IndicTrans2 output
 
 
 # ── Week 3 — Grammar pipeline ────────────────────────────────────────────────

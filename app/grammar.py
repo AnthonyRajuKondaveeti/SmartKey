@@ -266,7 +266,10 @@ class GrammarEngine:
             r'(?<=,)\s+(?:and|but|or|so|yet|because|although|since|while)\s+',
             flags=re.IGNORECASE,
         )
-        _TOKEN_EST = MAX_INPUT_LEN * 4   # ~4 chars per token
+        # coedit-small works reliably on ~50-token sentences.
+        # Prefix (~10 tokens) + sentence should stay under 128 tokens total.
+        # 200 chars ≈ 50 tokens — conservative but safe.
+        _TOKEN_EST = 200
 
         expanded: list = []
         for s in sentences:
@@ -335,10 +338,8 @@ class GrammarEngine:
 
         if len(sentences) > 1:
             log.debug(f"Grammar: split into {len(sentences)} sentences")
-            corrected_parts = [self._correct_single(s) for s in sentences]
-            result = " ".join(corrected_parts)
-        else:
-            result = self._correct_single(text)
+        corrected_parts = [self._correct_single(s) for s in sentences]
+        result = " ".join(corrected_parts)
 
         total_ms = (time.monotonic() - t_total) * 1000
         log.info(
@@ -414,6 +415,15 @@ class GrammarEngine:
             # Strip echoed task prefix if present
             if result.startswith(self._prefix):
                 result = result[len(self._prefix):].strip()
+
+            # If the model produced nothing (ran to MAX_OUTPUT_LEN on a chunk
+            # that was too long or too unusual), pass the original through.
+            if not result.strip():
+                log.warning(
+                    f"Grammar returned empty output for input "
+                    f"{repr(sentence[:60])} — passing through unchanged"
+                )
+                result = sentence
 
             log.debug(
                 f"Grammar sentence done in {elapsed:.0f}ms | {steps} steps | "

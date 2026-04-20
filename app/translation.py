@@ -1,13 +1,17 @@
 """
 translation.py
 --------------
-TranslationEngine — offline English → Hindi translation using the
+TranslationEngine — offline English → Indian language translation using the
 IndicTrans2 ONNX INT8 model.
+
+Supported target languages (pass as `target_lang`):
+  "hin_Deva"  — Hindi (Devanagari)   [default]
+  "tel_Telu"  — Telugu
 
 Features:
   - Loads model once at startup, keeps in memory
   - Runs inference on a background thread (never blocks the UI)
-  - LRU cache of last 20 translations with hit/miss counters
+  - LRU cache of last 20 translations (keyed by text + target language)
   - Falls back gracefully if model files are not yet downloaded
   - Detects "never loaded" vs "still loading" — no 30s silent hang
 
@@ -16,9 +20,10 @@ Usage:
     engine.load()   # call once at app start — runs on a bg thread
 
     engine.translate(
-        text      = "I will be late today.",
-        on_result = lambda hindi: print(hindi),
-        on_error  = lambda err:   print(f"Error: {err}"),
+        text        = "I will be late today.",
+        target_lang = "hin_Deva",          # or "tel_Telu" for Telugu
+        on_result   = lambda out: print(out),
+        on_error    = lambda err: print(f"Error: {err}"),
     )
 """
 
@@ -29,6 +34,56 @@ import numpy as np
 from collections import OrderedDict
 from typing import Callable, Optional
 from logger import log
+
+# IndicTrans2 outputs ALL Indic languages in Devanagari script internally.
+# postprocess_batch transliterates Devanagari → actual target script.
+# We use indic-transliteration (pure Python, no C++ required) for this.
+import unicodedata
+
+# Flores-200 lang code → indic_transliteration script constant
+_FLORES_TO_SCRIPT = {
+    "tel_Telu": "telugu",
+    "kan_Knda": "kannada",
+    "mal_Mlym": "malayalam",
+    "tam_Taml": "tamil",
+    "guj_Gujr": "gujarati",
+    "pan_Guru": "gurmukhi",
+    "ben_Beng": "bengali",
+    "ory_Orya": "oriya",
+}
+
+try:
+    from indic_transliteration import sanscript
+    from indic_transliteration.sanscript import transliterate as _transliterate
+    _TRANSLITERATION_AVAILABLE = True
+except ImportError:
+    _TRANSLITERATION_AVAILABLE = False
+
+
+def _preprocess(text: str, src_lang: str, tgt_lang: str) -> str:
+    """Normalise + inject IndicTrans2 language prefix."""
+    text = unicodedata.normalize("NFC", text.strip())
+    return f"{src_lang} {tgt_lang} {text}"
+
+
+_TRAILING_PUNCT = {".", "?", "!", "।", "…"}
+
+def _postprocess(text: str, tgt_lang: str, source: str = "") -> str:
+    """Transliterate Devanagari model output → target script (no-op for hin_Deva).
+    Also restores trailing punctuation that the model drops in greedy decoding."""
+    if _TRANSLITERATION_AVAILABLE and tgt_lang != "hin_Deva":
+        script = _FLORES_TO_SCRIPT.get(tgt_lang)
+        if script:
+            text = _transliterate(text, sanscript.DEVANAGARI, script)
+
+    # Restore terminal punctuation dropped by greedy decoding.
+    if source:
+        src_end = source.rstrip()[-1] if source.rstrip() else ""
+        out_end = text.rstrip()[-1]   if text.rstrip()   else ""
+        if src_end in _TRAILING_PUNCT and out_end not in _TRAILING_PUNCT:
+            text = text.rstrip() + src_end
+
+    return text
 
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -165,6 +220,14 @@ class TranslationEngine:
         self._decoder = ort.InferenceSession(dec_path)
         log.info(f"Decoder loaded in {(time.monotonic()-t0)*1000:.0f}ms")
 
+        if _TRANSLITERATION_AVAILABLE:
+            log.info("indic-transliteration ready — Telugu/other scripts enabled")
+        else:
+            log.warning(
+                "indic-transliteration not installed — Telugu will output Devanagari. "
+                "Run: pip install indic-transliteration"
+            )
+
     @property
     def is_ready(self) -> bool:
         return self._ready.is_set()
@@ -174,20 +237,26 @@ class TranslationEngine:
     def translate(
         self,
         text: str,
-        on_result: Callable[[str], None],
-        on_error:  Optional[Callable[[str], None]] = None,
+        on_result:   Callable[[str], None],
+        on_error:    Optional[Callable[[str], None]] = None,
+        target_lang: str = "hin_Deva",
     ) -> None:
         """
-        Translate `text` from English to Hindi asynchronously.
-        on_result(hindi) called on a background thread when done.
-        on_error(msg)    called if something fails.
+        Translate `text` from English to `target_lang` asynchronously.
+        on_result(text) called on a background thread when done.
+        on_error(msg)   called if something fails.
         Cache hit returns instantly without model inference.
+
+        target_lang: "hin_Deva" (Hindi) | "tel_Telu" (Telugu)
         """
-        log.info(f"Translate requested | input ({len(text)} chars): {repr(text[:100])}{'...' if len(text) > 100 else ''}")
+        log.info(
+            f"Translate requested | lang={target_lang} | "
+            f"input ({len(text)} chars): {repr(text[:100])}{'...' if len(text) > 100 else ''}"
+        )
 
         def _run():
             try:
-                result = self._translate_sync(text)
+                result = self._translate_sync(text, target_lang)
                 on_result(result)
             except Exception as e:
                 log.error(f"Translation error: {e}")
@@ -197,14 +266,15 @@ class TranslationEngine:
         t = threading.Thread(target=_run, daemon=True, name="TranslationEngine-Infer")
         t.start()
 
-    def _translate_sync(self, text: str) -> str:
+    def _translate_sync(self, text: str, target_lang: str = "hin_Deva") -> str:
         text = text.strip()
         if not text:
             log.debug("Empty input — returning empty string")
             return ""
 
-        # Cache hit
-        cached = self._cache.get(text)
+        # Cache key includes target language so Hindi/Telugu don't collide
+        cache_key = f"{target_lang}:{text}"
+        cached = self._cache.get(cache_key)
         if cached is not None:
             log.info(
                 f"Cache HIT ({self._cache.hits} hits / {self._cache.hits + self._cache.misses} total) | "
@@ -236,17 +306,18 @@ class TranslationEngine:
         # Serialize inference
         with self._lock:
             # Double-check cache
-            cached = self._cache.get(text)
+            cached = self._cache.get(cache_key)
             if cached is not None:
                 log.debug("Cache hit inside lock (another thread translated while waiting)")
                 return cached
 
-            # Tokenise
-            tagged_text = f"eng_Latn hin_Deva {text}"
-            log.debug(f"Tokenising: {repr(tagged_text[:120])}")
+            # Pre-process: normalise + inject IndicTrans2 language prefix.
+            processed = _preprocess(text, "eng_Latn", target_lang)
+
+            log.debug(f"Tokenising: {repr(processed[:120])}")
             t0 = time.monotonic()
             tok_out = self._tokenizer(
-                tagged_text,
+                processed,
                 return_tensors = "np",
                 padding        = True,
                 truncation     = True,
@@ -291,15 +362,18 @@ class TranslationEngine:
             decode_ms = (time.monotonic() - t0) * 1000
             log.debug(f"Decoder done in {decode_ms:.0f}ms | {steps} steps | output tokens: {decoder_ids.shape[1]}")
 
-            result = self._tokenizer.decode(decoder_ids[0], skip_special_tokens=True)
+            raw = self._tokenizer.decode(decoder_ids[0], skip_special_tokens=True)
+            # Post-process: transliterate + restore dropped terminal punctuation.
+            result = _postprocess(raw, target_lang, source=text)
 
-        self._cache.put(text, result)
+        self._cache.put(cache_key, result)
 
         log.info(
-            f"Translation complete | "
+            f"Translation complete | lang={target_lang} | "
             f"input: {repr(text[:60])}{'...' if len(text) > 60 else ''} | "
             f"output: {repr(result[:80])}{'...' if len(result) > 80 else ''} | "
             f"decoder steps: {steps} | decode time: {decode_ms:.0f}ms"
+            + (f" | raw: {repr(raw[:60])}" if raw != result else "")
         )
         return result
 

@@ -25,6 +25,7 @@ class SmartKeyboardPopup(QWidget):
         self._on_paste = on_paste
         self._translation_enabled = False
         self._current_relationship = 0
+        self._target_lang = "hin_Deva"   # default: Hindi
         self._processing = False
         self._translation_engine = None
         self._grammar_engine = None
@@ -77,7 +78,7 @@ class SmartKeyboardPopup(QWidget):
         self._grammar_btn = QPushButton("English Refiner")
         self._grammar_btn.setFixedHeight(36)
         
-        self._translation_btn = QPushButton("Hindi Translate")
+        self._translation_btn = QPushButton("Translate")
         self._translation_btn.setCheckable(True)
         self._translation_btn.setFixedHeight(36)
         self._translation_btn.setCursor(Qt.PointingHandCursor)
@@ -87,12 +88,32 @@ class SmartKeyboardPopup(QWidget):
         mode_container.addWidget(self._translation_btn, 1)
         layout.addLayout(mode_container)
 
-        # ── Relationship Chips ────────────────────────────────────────────────
+        # ── Translation Options (language + context) ──────────────────────────
         self._rel_group = QWidget()
         self._rel_group.setVisible(False)
         rel_layout = QVBoxLayout(self._rel_group)
         rel_layout.setContentsMargins(0, 0, 0, 0)
-        
+        rel_layout.setSpacing(10)
+
+        # Language selector
+        rel_layout.addWidget(self._section_label("LANGUAGE"))
+        lang_layout = QHBoxLayout()
+        lang_layout.setSpacing(8)
+        _LANGUAGES = [("Hindi", "hin_Deva"), ("Telugu", "tel_Telu")]
+        self._lang_buttons = []
+        for i, (label, code) in enumerate(_LANGUAGES):
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setChecked(i == 0)
+            btn.setFixedHeight(28)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.clicked.connect(lambda _, idx=i, c=code: self._set_language(idx, c))
+            self._lang_buttons.append(btn)
+            lang_layout.addWidget(btn)
+        lang_layout.addStretch()
+        rel_layout.addLayout(lang_layout)
+
+        # Relationship / tone chips
         rel_layout.addWidget(self._section_label("CONTEXT"))
         chips_layout = QHBoxLayout()
         chips_layout.setSpacing(8)
@@ -232,6 +253,10 @@ class SmartKeyboardPopup(QWidget):
         self._paste_btn.setEnabled(False)
         self._reset_process_btn()
 
+    def _set_language(self, idx, code):
+        self._target_lang = code
+        for i, btn in enumerate(self._lang_buttons): btn.setChecked(i == idx)
+
     def _set_relationship(self, idx):
         self._current_relationship = idx
         for i, btn in enumerate(self._rel_buttons): btn.setChecked(i == idx)
@@ -253,12 +278,15 @@ class SmartKeyboardPopup(QWidget):
         else: self._run_grammar(text)
 
     def _run_translation(self, text):
+        lang = self._target_lang
         if self._grammar_engine and self._grammar_engine.is_ready:
-            self._grammar_engine.correct(text, on_result=lambda c: self._do_translate(c or text), on_error=lambda e: self._do_translate(text))
-        else: self._do_translate(text)
+            self._grammar_engine.correct(text, on_result=lambda c: self._do_translate(c or text, lang), on_error=lambda e: self._do_translate(text, lang))
+        else:
+            self._do_translate(text, lang)
 
-    def _do_translate(self, text):
-        if self._translation_engine: self._translation_engine.translate(text=text, on_result=self._on_bg_result, on_error=self._on_bg_error)
+    def _do_translate(self, text, target_lang="hin_Deva"):
+        if self._translation_engine:
+            self._translation_engine.translate(text=text, target_lang=target_lang, on_result=self._on_bg_result, on_error=self._on_bg_error)
 
     def _run_grammar(self, text):
         if self._grammar_engine: self._grammar_engine.correct(text=text, on_result=self._on_bg_result, on_error=self._on_bg_error)
