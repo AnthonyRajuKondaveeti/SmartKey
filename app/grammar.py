@@ -17,12 +17,83 @@ Generation: greedy autoregressive decode (start=pad_id=0, stop=eos_id=1).
 """
 
 import os
+import re
 import time
 import threading
+import unicodedata
+import concurrent.futures
 import numpy as np
-from collections import OrderedDict
-from typing import Callable, Optional
+from typing import Callable, List, Optional, Tuple
 from logger import log
+from cache import LRUCache
+from utils import ABBREV_RE
+
+
+# ── Slang / abbreviation normalization ───────────────────────────────────────
+# Applied before grammar correction so the model sees standard English.
+# Ordered: longer/more-specific patterns first to avoid partial matches.
+_SLANG: List[Tuple[str, str]] = [
+    # Contractions & informal spellings
+    (r"\bgonna\b",      "going to"),
+    (r"\bwanna\b",      "want to"),
+    (r"\bgotta\b",      "got to"),
+    (r"\bkinda\b",      "kind of"),
+    (r"\bsorta\b",      "sort of"),
+    (r"\boutta\b",      "out of"),
+    (r"\blotta\b",      "a lot of"),
+    (r"\bcuz\b",        "because"),
+    (r"\bcause\b",      "because"),
+    (r"\bcos\b",        "because"),
+    (r"\btho\b",        "though"),
+    (r"\bthru\b",       "through"),
+    (r"\bwud\b",        "would"),
+    (r"\bcud\b",        "could"),
+    (r"\bsud\b",        "should"),
+    # Abbreviations
+    (r"\bidk\b",        "I don't know"),
+    (r"\bimo\b",        "in my opinion"),
+    (r"\bimho\b",       "in my honest opinion"),
+    (r"\bngl\b",        "not going to lie"),
+    (r"\btbh\b",        "to be honest"),
+    (r"\bbtw\b",        "by the way"),
+    (r"\bfyi\b",        "for your information"),
+    (r"\bomg\b",        "oh my god"),
+    (r"\bsmh\b",        "shaking my head"),
+    (r"\bik\b",         "I know"),
+    (r"\brn\b",         "right now"),
+    (r"\babt\b",        "about"),
+    (r"\bpls\b",        "please"),
+    (r"\bplz\b",        "please"),
+    (r"\bthx\b",        "thanks"),
+    (r"\bthnx\b",       "thanks"),
+    (r"\bthanku\b",     "thank you"),
+    (r"\bty\b",         "thank you"),
+    (r"\bttyl\b",       "talk to you later"),
+    (r"\btyl\b",        "talk to you later"),
+    (r"\bb4\b",         "before"),
+    (r"\b2day\b",       "today"),
+    (r"\b2morrow\b",    "tomorrow"),
+    (r"\b2nite\b",      "tonight"),
+    # Single-letter informal substitutions (conservative — only unambiguous ones)
+    (r"\bu\b",          "you"),
+    (r"\bur\b",         "your"),
+    # Fillers to remove
+    (r"\blol\b",        ""),
+    (r"\blmao\b",       ""),
+    (r"\bhaha\b",       ""),
+]
+
+_SLANG_RE: List[Tuple] = [
+    (re.compile(pat, re.IGNORECASE), repl) for pat, repl in _SLANG
+]
+
+
+def _normalize_slang(text: str) -> str:
+    for pattern, replacement in _SLANG_RE:
+        text = pattern.sub(replacement, text)
+    # Collapse multiple spaces left by filler removal
+    text = re.sub(r"  +", " ", text).strip()
+    return text
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -33,45 +104,23 @@ FALLBACK_SUBDIR   = "visheratin-tiny_int8"
 COEDIT_PREFIX     = "Fix grammatical errors in this sentence: "
 VISHERATIN_PREFIX = "grammar: "
 
-CACHE_SIZE     = 20
-MAX_INPUT_LEN  = 256   # per-sentence limit (model trained on sentences, not paragraphs)
+CACHE_SIZE     = 200
+MAX_TEXT_SIZE  = 5_000  # char limit — reject before splitting to avoid long executor queues
+MAX_INPUT_LEN  = 256    # per-sentence limit (model trained on sentences, not paragraphs)
 MAX_OUTPUT_LEN = 256
-DECODER_START  = 0     # T5 pad_token_id used as decoder start token
-EOS_ID         = 1     # T5 eos_token_id
+DECODER_START  = 0      # T5 pad_token_id used as decoder start token
+EOS_ID         = 1      # T5 eos_token_id
 LOAD_TIMEOUT   = 60
 
+# Compiled once at import time — used by _split_sentences on every call.
+_CLAUSE_RE = re.compile(
+    r';\s+|(?<=,)\s+(?:and|but|or|so|yet|because|although|since|while)\s+',
+    flags=re.IGNORECASE,
+)
 
-# ── LRU Cache ─────────────────────────────────────────────────────────────────
-
-class _LRUCache:
-    """Thread-safe LRU cache."""
-
-    def __init__(self, maxsize: int):
-        self._cache   = OrderedDict()
-        self._maxsize = maxsize
-        self._lock    = threading.Lock()
-        self.hits     = 0
-        self.misses   = 0
-
-    def get(self, key: str) -> Optional[str]:
-        with self._lock:
-            if key not in self._cache:
-                self.misses += 1
-                return None
-            self._cache.move_to_end(key)
-            self.hits += 1
-            return self._cache[key]
-
-    def put(self, key: str, value: str) -> None:
-        with self._lock:
-            if key in self._cache:
-                self._cache.move_to_end(key)
-            self._cache[key] = value
-            if len(self._cache) > self._maxsize:
-                self._cache.popitem(last=False)
-
-    def __len__(self) -> int:
-        return len(self._cache)
+# Use half the logical cores, capped at 8 — avoids over-subscribing on
+# 2-core laptops while taking advantage of more cores when available.
+_ORT_THREADS = min(max(1, (os.cpu_count() or 4)), 8)
 
 
 # ── GrammarEngine ─────────────────────────────────────────────────────────────
@@ -93,10 +142,15 @@ class GrammarEngine:
         self._decoder      = None
         self._prefix       = COEDIT_PREFIX
         self._active_model = None
-        self._cache        = _LRUCache(CACHE_SIZE)
-        self._ready        = threading.Event()
-        self._load_called  = False
-        self._lock         = threading.Lock()
+        self._cache            = LRUCache("grammar", CACHE_SIZE)
+        self._ready            = threading.Event()
+        self._failed           = False
+        self._load_called      = False
+        self._lock             = threading.Lock()
+        self._prefix_token_len = 0   # set after tokenizer loads; used to tighten max_length
+        self._executor         = concurrent.futures.ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="GrammarEngine"
+        )
         log.debug(f"GrammarEngine created | base_dir={model_dir}")
 
     # ── Loading ───────────────────────────────────────────────────────────────
@@ -125,6 +179,7 @@ class GrammarEngine:
             except Exception as e:
                 elapsed = (time.monotonic() - t_start) * 1000
                 log.error(f"GrammarEngine load failed after {elapsed:.0f}ms: {e}")
+                self._failed = True
                 if on_error:
                     on_error(str(e))
 
@@ -159,19 +214,27 @@ class GrammarEngine:
                 t0 = time.monotonic()
                 self._tokenizer = AutoTokenizer.from_pretrained(path)
                 log.info(f"GrammarEngine: tokenizer loaded in {(time.monotonic()-t0)*1000:.0f}ms")
+                time.sleep(0)   # yield GIL so Qt can dispatch any pending slots
+
+                sess_opts = ort.SessionOptions()
+                sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                sess_opts.intra_op_num_threads = _ORT_THREADS
 
                 log.info(f"GrammarEngine: loading encoder from {subdir} ...")
                 t0 = time.monotonic()
-                self._encoder = ort.InferenceSession(enc_path)
+                self._encoder = ort.InferenceSession(enc_path, sess_options=sess_opts)
                 log.info(f"GrammarEngine: encoder loaded in {(time.monotonic()-t0)*1000:.0f}ms")
+                time.sleep(0)   # yield GIL
 
                 log.info(f"GrammarEngine: loading decoder from {subdir} ...")
                 t0 = time.monotonic()
-                self._decoder = ort.InferenceSession(dec_path)
+                self._decoder = ort.InferenceSession(dec_path, sess_options=sess_opts)
                 log.info(f"GrammarEngine: decoder loaded in {(time.monotonic()-t0)*1000:.0f}ms")
 
-                self._prefix       = prefix
-                self._active_model = subdir
+                self._prefix           = prefix
+                self._active_model     = subdir
+                self._prefix_token_len = len(self._tokenizer.encode(prefix))
+                log.debug(f"GrammarEngine: prefix token length = {self._prefix_token_len}")
                 return
             except Exception as e:
                 log.warning(f"GrammarEngine: failed to load {subdir}: {e}")
@@ -192,6 +255,10 @@ class GrammarEngine:
         return self._ready.is_set()
 
     @property
+    def is_failed(self) -> bool:
+        return self._failed
+
+    @property
     def active_model(self) -> Optional[str]:
         """Subdir name of the loaded model, or None until ready."""
         return self._active_model
@@ -209,10 +276,7 @@ class GrammarEngine:
         on_result(corrected_text) called on a background thread when done.
         on_error(msg) called on failure.
         """
-        log.info(
-            f"Grammar correct requested | "
-            f"{len(text)} chars: {repr(text[:80])}{'...' if len(text) > 80 else ''}"
-        )
+        log.info(f"Grammar correct requested | {len(text)} chars")
 
         def _run():
             try:
@@ -222,7 +286,7 @@ class GrammarEngine:
                 if on_error:
                     on_error(str(e))
 
-        threading.Thread(target=_run, daemon=True, name="GrammarEngine-Infer").start()
+        self._executor.submit(_run)
 
     # ── Sentence splitting ────────────────────────────────────────────────────
 
@@ -248,10 +312,12 @@ class GrammarEngine:
           comma before the midpoint so each half can be corrected
           independently.
         """
-        import re
-
         # ── Pass 1: sentence boundaries ────────────────────────────────────
-        raw_parts = re.split(r'(?<=[.!?])\s+', text.strip())
+        # Temporarily replace abbreviation periods (Dr., Mr., etc.) with a
+        # null-byte placeholder so they don't trigger sentence splits.
+        protected = ABBREV_RE.sub(lambda m: m.group(0)[:-1] + "\x00", text.strip())
+        raw_parts = re.split(r'(?<=[.!?])\s+', protected)
+        raw_parts = [p.replace("\x00", ".") for p in raw_parts]
 
         sentences: list = []
         for part in raw_parts:
@@ -261,11 +327,6 @@ class GrammarEngine:
                     sentences.append(line)
 
         # ── Pass 2: clause splitting for long sentences ────────────────────
-        _CLAUSE_RE = re.compile(
-            r';\s+|'
-            r'(?<=,)\s+(?:and|but|or|so|yet|because|although|since|while)\s+',
-            flags=re.IGNORECASE,
-        )
         # coedit-small works reliably on ~50-token sentences.
         # Prefix (~10 tokens) + sentence should stay under 128 tokens total.
         # 200 chars ≈ 50 tokens — conservative but safe.
@@ -308,9 +369,13 @@ class GrammarEngine:
         corrected individually (the model is sentence-level) then rejoined.
         Full-text result is cached so repeated identical inputs are instant.
         """
-        text = text.strip()
+        text = _normalize_slang(unicodedata.normalize("NFC", text.strip()))
         if not text:
             return ""
+
+        if len(text) > MAX_TEXT_SIZE:
+            log.warning(f"Grammar input too long ({len(text)} chars > {MAX_TEXT_SIZE}) — truncating")
+            text = text[:MAX_TEXT_SIZE]
 
         # Full-text cache check
         cached = self._cache.get(text)
@@ -333,20 +398,25 @@ class GrammarEngine:
                 f"Grammar model did not finish loading within {LOAD_TIMEOUT}s."
             )
 
-        sentences = self._split_sentences(text)
+        # Correct line-by-line so \n boundaries are preserved in the output.
+        # Within each line, _split_sentences handles long clauses as before.
         t_total = time.monotonic()
-
-        if len(sentences) > 1:
-            log.debug(f"Grammar: split into {len(sentences)} sentences")
-        corrected_parts = [self._correct_single(s) for s in sentences]
-        result = " ".join(corrected_parts)
+        raw_lines = text.splitlines()
+        corrected_lines = []
+        total_sentences = 0
+        for line in raw_lines:
+            if not line.strip():
+                corrected_lines.append(line)
+                continue
+            sentences = self._split_sentences(line)
+            total_sentences += len(sentences)
+            corrected_lines.append(" ".join(self._correct_single(s) for s in sentences))
+        result = "\n".join(corrected_lines)
 
         total_ms = (time.monotonic() - t_total) * 1000
         log.info(
-            f"Grammar done in {total_ms:.0f}ms | {len(sentences)} sentence(s) | "
-            f"model: {self._active_model} | "
-            f"input: {repr(text[:60])}{'...' if len(text) > 60 else ''} | "
-            f"output: {repr(result[:60])}{'...' if len(result) > 60 else ''}"
+            f"Grammar done in {total_ms:.0f}ms | {total_sentences} sentence(s) | "
+            f"model: {self._active_model} | input: {len(text)} chars | output: {len(result)} chars"
         )
 
         self._cache.put(text, result)
@@ -358,7 +428,7 @@ class GrammarEngine:
         # a different paragraph)
         cached = self._cache.get(sentence)
         if cached is not None:
-            log.debug(f"Grammar sentence cache HIT: {repr(sentence[:60])}")
+            log.debug(f"Grammar sentence cache HIT: {len(sentence)} chars")
             return cached
 
         with self._lock:
@@ -368,15 +438,17 @@ class GrammarEngine:
                 return cached
 
             prefixed = self._prefix + sentence
-            log.debug(f"Grammar sentence input: {repr(prefixed[:120])}")
+            log.debug(f"Grammar sentence input: {len(prefixed)} chars")
             t0 = time.monotonic()
 
+            # Reserve space for the prefix tokens so the sentence itself is not truncated.
+            effective_max = max(32, MAX_INPUT_LEN - self._prefix_token_len)
             tok = self._tokenizer(
                 prefixed,
                 return_tensors = "np",
                 padding        = True,
                 truncation     = True,
-                max_length     = MAX_INPUT_LEN,
+                max_length     = effective_max,
             )
             input_ids      = tok["input_ids"].astype(np.int64)
             attention_mask = tok["attention_mask"].astype(np.int64)
@@ -412,22 +484,29 @@ class GrammarEngine:
             elapsed = (time.monotonic() - t0) * 1000
             result = self._tokenizer.decode(decoder_ids[0], skip_special_tokens=True)
 
-            # Strip echoed task prefix if present
+            # Strip echoed task prefix if the model regurgitated it.
             if result.startswith(self._prefix):
                 result = result[len(self._prefix):].strip()
+            elif result.startswith('"' + self._prefix) or result.startswith("'" + self._prefix):
+                result = result[1 + len(self._prefix):].strip()
+            # Mid-output prefix embedding (model went off the rails on this chunk)
+            # — fall back to original rather than truncating mid-sentence.
+            elif self._prefix in result:
+                log.warning(f"Model embedded prefix mid-output — passing sentence through unchanged")
+                result = sentence
 
             # If the model produced nothing (ran to MAX_OUTPUT_LEN on a chunk
             # that was too long or too unusual), pass the original through.
             if not result.strip():
                 log.warning(
                     f"Grammar returned empty output for input "
-                    f"{repr(sentence[:60])} — passing through unchanged"
+                    f"({len(sentence)} chars) — passing through unchanged"
                 )
                 result = sentence
 
             log.debug(
                 f"Grammar sentence done in {elapsed:.0f}ms | {steps} steps | "
-                f"output: {repr(result[:60])}"
+                f"output: {len(result)} chars"
             )
 
         self._cache.put(sentence, result)

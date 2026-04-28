@@ -1,96 +1,147 @@
 """
 hotkey_listener.py
 ------------------
-Registers a system-wide hotkey (Ctrl+Shift+T) using pynput.
-When triggered, captures selected text and signals the popup to open.
+Registers a system-wide hotkey using pynput.
 
-Runs on a background daemon thread — never blocks the UI.
+The hotkey string is read from settings.json (default: "ctrl+alt+k").
+Format: modifier keys joined by "+" then the trigger key.
+  Examples: "ctrl+alt+k", "ctrl+alt+k", "ctrl+shift+h"
 
-Uses a manual Listener instead of GlobalHotKeys to avoid a known
-Windows bug where missed modifier-release events cause the hotkey
-to fire on a bare 't' keypress.
+Uses a raw Listener with explicit modifier tracking to avoid the Windows
+bug where missed modifier-release events cause the hotkey to fire on a
+bare keypress.
 """
 
+import queue
 import threading
 from pynput import keyboard
 from typing import Callable
 from logger import log
 
 
-HOTKEY_SEQUENCE = "<ctrl>+<shift>+t"
-
-
-def start_hotkey_listener(on_trigger: Callable[[], None]) -> keyboard.Listener:
+def _parse_hotkey(hotkey_str: str) -> tuple:
     """
-    Start a background hotkey listener for Ctrl+Shift+T.
+    Parse "ctrl+alt+k" → ({"ctrl", "shift"}, "t").
+    Modifier names: ctrl, shift, alt.
+    """
+    _MODIFIERS = {"ctrl", "shift", "alt"}
+    parts      = [p.strip().lower() for p in hotkey_str.split("+")]
+    modifiers  = {p for p in parts if p in _MODIFIERS}
+    triggers   = [p for p in parts if p not in _MODIFIERS]
+    trigger    = triggers[0] if triggers else "t"
+    return modifiers, trigger
 
-    Uses a raw Listener with explicit modifier tracking. After each
-    activation the state is fully cleared, preventing the stale-modifier
-    bug present in pynput's GlobalHotKeys on Windows.
+
+def start_hotkey_listener(
+    on_trigger:  Callable[[], None],
+    hotkey_str:  str = "ctrl+alt+k",
+) -> keyboard.Listener:
+    """
+    Start a background hotkey listener.
 
     Args:
-        on_trigger: Callback with no arguments, called when the hotkey fires.
+        on_trigger:  Callback with no arguments called when the hotkey fires.
+        hotkey_str:  Hotkey string, e.g. "ctrl+alt+k" or "ctrl+alt+k".
 
     Returns:
         The running pynput Listener. Call .stop() to end it.
     """
-    pressed_modifiers = set()
+    required_mods, trigger_char = _parse_hotkey(hotkey_str)
+
+    # Ctrl+<key> sends a control character instead of the letter.
+    # Compute it so we match both the plain char and the Ctrl-char.
+    ctrl_char = None
+    if len(trigger_char) == 1 and "a" <= trigger_char <= "z":
+        ctrl_char = chr(ord(trigger_char) - ord("a") + 1)
+
+    log.info(
+        f"Hotkey listener arming: {hotkey_str!r} "
+        f"| mods={required_mods} trigger={trigger_char!r} ctrl_char={ctrl_char!r}"
+    )
+
+    # Windows VK code for the trigger key — used when key.char is None
+    # (e.g. Ctrl+Alt+K suppresses char generation on Windows).
+    # VK codes for A-Z and 0-9 match their ASCII upper-case values exactly.
+    _trigger_vk = ord(trigger_char.upper())
+
+    pressed_modifiers: set = set()
     fired = False
 
-    def _safe_trigger():
-        log.info("Hotkey fired — dispatching trigger on worker thread")
-        try:
-            on_trigger()
-        except Exception as exc:
-            log.exception(f"Hotkey callback error: {exc}")
+    # Single persistent worker thread — no new thread is spawned per keypress.
+    # Queue is bounded to 1 so rapid re-presses don't queue up stale events.
+    # Sentinel None tells the worker to exit (sent when listener is stopped).
+    _trigger_queue: queue.Queue = queue.Queue(maxsize=1)
+
+    def _worker():
+        while True:
+            item = _trigger_queue.get()
+            if item is None:   # shutdown signal
+                break
+            log.info("Hotkey fired — dispatching on worker thread")
+            try:
+                on_trigger()
+            except Exception as exc:
+                log.exception(f"Hotkey callback error: {exc}")
+
+    threading.Thread(target=_worker, daemon=True, name="HotkeyWorker").start()
 
     def _on_press(key):
         nonlocal fired
 
         if key in (keyboard.Key.ctrl_l, keyboard.Key.ctrl_r):
             pressed_modifiers.add("ctrl")
-            log.debug(f"Modifier pressed: ctrl  | held={pressed_modifiers}")
         elif key in (keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r):
             pressed_modifiers.add("shift")
-            log.debug(f"Modifier pressed: shift | held={pressed_modifiers}")
-        elif _is_t(key):
-            log.debug(f"'T' pressed | held={pressed_modifiers} | fired={fired}")
-            if "ctrl" in pressed_modifiers and "shift" in pressed_modifiers and not fired:
+        elif key in (keyboard.Key.alt_l, keyboard.Key.alt_r, keyboard.Key.alt):
+            pressed_modifiers.add("alt")
+        elif _is_trigger(key):
+            log.debug(f"Trigger key pressed | held={pressed_modifiers} | fired={fired}")
+            if required_mods <= pressed_modifiers and not fired:
                 fired = True
-                log.debug("Ctrl+Shift+T combo detected — spawning trigger thread")
-                t = threading.Thread(target=_safe_trigger, daemon=True)
-                t.start()
-            else:
-                log.debug("'T' pressed but combo incomplete or already fired — ignored")
+                log.debug(f"Hotkey combo detected ({hotkey_str}) — queuing trigger")
+                try:
+                    _trigger_queue.put_nowait(1)
+                except queue.Full:
+                    log.debug("Trigger queue full — rapid re-press ignored")
 
     def _on_release(key):
         nonlocal fired
 
         if key in (keyboard.Key.ctrl_l, keyboard.Key.ctrl_r):
             pressed_modifiers.discard("ctrl")
-            log.debug(f"Modifier released: ctrl  | held={pressed_modifiers}")
         elif key in (keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r):
             pressed_modifiers.discard("shift")
-            log.debug(f"Modifier released: shift | held={pressed_modifiers}")
+        elif key in (keyboard.Key.alt_l, keyboard.Key.alt_r, keyboard.Key.alt):
+            pressed_modifiers.discard("alt")
 
-        if _is_t(key) or key in (
-            keyboard.Key.ctrl_l, keyboard.Key.ctrl_r,
-            keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r,
-        ):
-            if fired:
-                log.debug("Fired flag reset on key release")
+        if _is_trigger(key):
             fired = False
 
-    def _is_t(key):
-        # char-only matching avoids vk false-triggers.
-        # When Ctrl is held, pynput sets key.char to the control character
-        # \x14 (ASCII 20 = Ctrl+T) instead of "t" — match both.
-        if not (hasattr(key, "char") and key.char is not None):
-            return False
-        return key.char.lower() == "t" or key.char == "\x14"
+    def _is_trigger(key) -> bool:
+        # Primary: match by character (plain press or ctrl-char variant)
+        if hasattr(key, "char") and key.char is not None:
+            c = key.char.lower()
+            if c == trigger_char or (ctrl_char is not None and key.char == ctrl_char):
+                return True
+        # Fallback: match by virtual key code — necessary when Ctrl+Alt suppresses
+        # char generation (common on Windows for Ctrl+Alt+<letter> combos).
+        if hasattr(key, "vk") and key.vk is not None:
+            return key.vk == _trigger_vk
+        return False
 
-    listener = keyboard.Listener(on_press=_on_press, on_release=_on_release)
-    listener.daemon = True
-    listener.start()
-    log.info(f"Hotkey listener armed: {HOTKEY_SEQUENCE}")
-    return listener
+    class _Listener:
+        """Thin wrapper that shuts down the worker thread on stop()."""
+        def __init__(self, inner, q):
+            self._inner = inner
+            self._q     = q
+        def stop(self):
+            try:
+                self._q.put_nowait(None)   # wake worker so it can exit
+            except queue.Full:
+                pass
+            self._inner.stop()
+
+    inner = keyboard.Listener(on_press=_on_press, on_release=_on_release)
+    inner.daemon = True
+    inner.start()
+    return _Listener(inner, _trigger_queue)

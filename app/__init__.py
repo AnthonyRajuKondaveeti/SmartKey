@@ -1,1 +1,2 @@
-# Smart Desktop Keyboard — app package
+# Smart Keyboard — app package
+from version import __version__  # noqa: F401

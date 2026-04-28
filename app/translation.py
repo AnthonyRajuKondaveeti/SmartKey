@@ -28,12 +28,16 @@ Usage:
 """
 
 import os
+import re
 import time
+import hashlib
 import threading
+import concurrent.futures
 import numpy as np
-from collections import OrderedDict
 from typing import Callable, Optional
 from logger import log
+from cache import LRUCache
+from utils import ABBREV_RE
 
 # IndicTrans2 outputs ALL Indic languages in Devanagari script internally.
 # postprocess_batch transliterates Devanagari → actual target script.
@@ -59,6 +63,21 @@ try:
 except ImportError:
     _TRANSLITERATION_AVAILABLE = False
 
+# Devanagari Unicode block — U+0900 to U+097F
+_DEVANAGARI_RE = re.compile(r'[ऀ-ॿ]')
+
+
+def _has_devanagari(text: str) -> bool:
+    """True if the model output is in Devanagari and needs script conversion.
+
+    The real IndicTrans2 ONNX model generates output in the target script
+    directly (Telugu in Telugu Unicode, etc.).  Only call transliterate()
+    when the output is actually Devanagari — otherwise transliterate()
+    treats native-script characters as invalid Devanagari and drops them,
+    producing empty / truncated text.
+    """
+    return bool(_DEVANAGARI_RE.search(text))
+
 
 def _preprocess(text: str, src_lang: str, tgt_lang: str) -> str:
     """Normalise + inject IndicTrans2 language prefix."""
@@ -69,14 +88,20 @@ def _preprocess(text: str, src_lang: str, tgt_lang: str) -> str:
 _TRAILING_PUNCT = {".", "?", "!", "।", "…"}
 
 def _postprocess(text: str, tgt_lang: str, source: str = "") -> str:
-    """Transliterate Devanagari model output → target script (no-op for hin_Deva).
-    Also restores trailing punctuation that the model drops in greedy decoding."""
+    """Optionally transliterate Devanagari model output → target script.
+
+    Transliteration is skipped when the model has already produced output
+    in the correct target script (which the ONNX model does for Telugu, etc.).
+    """
     if _TRANSLITERATION_AVAILABLE and tgt_lang != "hin_Deva":
         script = _FLORES_TO_SCRIPT.get(tgt_lang)
-        if script:
+        if script and _has_devanagari(text):
             text = _transliterate(text, sanscript.DEVANAGARI, script)
 
-    # Restore terminal punctuation dropped by greedy decoding.
+    # IndicTrans2 consistently outputs a space before । — strip it.
+    text = re.sub(r"\s+।", "।", text)
+
+    # Restore terminal punctuation dropped by greedy/beam decoding.
     if source:
         src_end = source.rstrip()[-1] if source.rstrip() else ""
         out_end = text.rstrip()[-1]   if text.rstrip()   else ""
@@ -88,44 +113,27 @@ def _postprocess(text: str, tgt_lang: str, source: str = "") -> str:
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-CACHE_SIZE     = 20    # Number of translations to keep in memory
-MAX_INPUT_LEN  = 256   # Token limit — matches IndicTrans2 training
-MAX_OUTPUT_LEN = 256
-NUM_BEAMS      = 4     # Beam search width (quality vs speed)
-LOAD_TIMEOUT   = 60    # Seconds to wait for model load before giving up
+_ORT_THREADS = min(max(1, (os.cpu_count() or 4)), 8)
+
+CACHE_SIZE          = 200
+MAX_INPUT_LEN       = 256   # Token limit — matches IndicTrans2 training
+MAX_TEXT_SIZE       = 5_000  # Char limit — reject before tokenisation to avoid CPU spike
+MAX_OUTPUT_LEN      = 384
+NUM_BEAMS           = 4     # Beam search width (quality vs speed)
+REPETITION_PENALTY  = 1.3   # Penalise repeated tokens during decoding
+LOAD_TIMEOUT        = 60    # Seconds to wait for model load before giving up
+
+# Split long inputs into per-sentence chunks above this char count.
+# Each sentence is translated independently then rejoined — avoids truncation
+# and keeps attention focused on one thought at a time.
+_SENTENCE_SPLIT_THRESHOLD = 180  # ~45 tokens; typical 2-sentence message
 
 
-# ── LRU Cache ────────────────────────────────────────────────────────────────
-
-class _LRUCache:
-    """Thread-safe LRU cache backed by an OrderedDict."""
-
-    def __init__(self, maxsize: int):
-        self._cache:   OrderedDict = OrderedDict()
-        self._maxsize: int         = maxsize
-        self._lock:    threading.Lock = threading.Lock()
-        self.hits:   int = 0
-        self.misses: int = 0
-
-    def get(self, key: str) -> Optional[str]:
-        with self._lock:
-            if key not in self._cache:
-                self.misses += 1
-                return None
-            self._cache.move_to_end(key)
-            self.hits += 1
-            return self._cache[key]
-
-    def put(self, key: str, value: str) -> None:
-        with self._lock:
-            if key in self._cache:
-                self._cache.move_to_end(key)
-            self._cache[key] = value
-            if len(self._cache) > self._maxsize:
-                self._cache.popitem(last=False)
-
-    def __len__(self) -> int:
-        return len(self._cache)
+def _split_for_translation(text: str) -> list:
+    """Split text on sentence boundaries, preserving abbreviation periods."""
+    protected = ABBREV_RE.sub(lambda m: m.group(0)[:-1] + "\x00", text.strip())
+    parts = re.split(r'(?<=[.!?।])\s+', protected)
+    return [p.replace("\x00", ".").strip() for p in parts if p.strip()] or [text]
 
 
 # ── TranslationEngine ─────────────────────────────────────────────────────────
@@ -145,10 +153,14 @@ class TranslationEngine:
         self._tokenizer   = None
         self._encoder     = None
         self._decoder     = None
-        self._cache       = _LRUCache(CACHE_SIZE)
+        self._cache       = LRUCache("translation", CACHE_SIZE)
         self._ready       = threading.Event()
+        self._failed      = False
         self._load_called = False
         self._lock        = threading.Lock()
+        self._executor    = concurrent.futures.ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="TranslationEngine"
+        )
         log.debug(f"TranslationEngine created | model_dir={model_dir}")
 
     # ── Loading ───────────────────────────────────────────────────────────────
@@ -178,6 +190,7 @@ class TranslationEngine:
             except Exception as e:
                 elapsed = (time.monotonic() - t_start) * 1000
                 log.error(f"Model load failed after {elapsed:.0f}ms: {e}")
+                self._failed = True
                 if on_error:
                     on_error(str(e))
 
@@ -205,19 +218,28 @@ class TranslationEngine:
 
         log.info("Loading tokenizer ...")
         t0 = time.monotonic()
+        # trust_remote_code is required — IndicTrans2 ships a custom tokenizer
+        # class inside the model directory that transformers must execute.
+        # Risk is contained: the model directory is local and user-controlled.
         self._tokenizer = AutoTokenizer.from_pretrained(
             self._model_dir, trust_remote_code=True
         )
         log.info(f"Tokenizer loaded in {(time.monotonic()-t0)*1000:.0f}ms")
+        time.sleep(0)   # yield GIL so Qt can dispatch any pending slots
+
+        sess_opts = ort.SessionOptions()
+        sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        sess_opts.intra_op_num_threads = _ORT_THREADS
 
         log.info(f"Loading ONNX encoder ({enc_path}) ...")
         t0 = time.monotonic()
-        self._encoder = ort.InferenceSession(enc_path)
+        self._encoder = ort.InferenceSession(enc_path, sess_options=sess_opts)
         log.info(f"Encoder loaded in {(time.monotonic()-t0)*1000:.0f}ms")
+        time.sleep(0)   # yield GIL
 
         log.info(f"Loading ONNX decoder ({dec_path}) ...")
         t0 = time.monotonic()
-        self._decoder = ort.InferenceSession(dec_path)
+        self._decoder = ort.InferenceSession(dec_path, sess_options=sess_opts)
         log.info(f"Decoder loaded in {(time.monotonic()-t0)*1000:.0f}ms")
 
         if _TRANSLITERATION_AVAILABLE:
@@ -231,6 +253,10 @@ class TranslationEngine:
     @property
     def is_ready(self) -> bool:
         return self._ready.is_set()
+
+    @property
+    def is_failed(self) -> bool:
+        return self._failed
 
     # ── Translation ───────────────────────────────────────────────────────────
 
@@ -249,10 +275,7 @@ class TranslationEngine:
 
         target_lang: "hin_Deva" (Hindi) | "tel_Telu" (Telugu)
         """
-        log.info(
-            f"Translate requested | lang={target_lang} | "
-            f"input ({len(text)} chars): {repr(text[:100])}{'...' if len(text) > 100 else ''}"
-        )
+        log.info(f"Translate requested | lang={target_lang} | input: {len(text)} chars")
 
         def _run():
             try:
@@ -263,8 +286,7 @@ class TranslationEngine:
                 if on_error:
                     on_error(str(e))
 
-        t = threading.Thread(target=_run, daemon=True, name="TranslationEngine-Infer")
-        t.start()
+        self._executor.submit(_run)
 
     def _translate_sync(self, text: str, target_lang: str = "hin_Deva") -> str:
         text = text.strip()
@@ -272,19 +294,21 @@ class TranslationEngine:
             log.debug("Empty input — returning empty string")
             return ""
 
-        # Cache key includes target language so Hindi/Telugu don't collide
-        cache_key = f"{target_lang}:{text}"
+        if len(text) > MAX_TEXT_SIZE:
+            log.warning(f"Input too long ({len(text)} chars > {MAX_TEXT_SIZE}) — truncating")
+            text = text[:MAX_TEXT_SIZE]
+
+        cache_key = f"{target_lang}:{hashlib.md5(text.encode()).hexdigest()}"
         cached = self._cache.get(cache_key)
         if cached is not None:
             log.info(
                 f"Cache HIT ({self._cache.hits} hits / {self._cache.hits + self._cache.misses} total) | "
-                f"result: {repr(cached[:80])}{'...' if len(cached) > 80 else ''}"
+                f"result: {len(cached)} chars"
             )
             return cached
 
         log.debug(f"Cache MISS ({self._cache.misses} misses so far)")
 
-        # FIX BUG 9: Distinguish "load() never called" from "still loading"
         if not self._load_called:
             raise RuntimeError(
                 "TranslationEngine.load() was never called. "
@@ -305,82 +329,125 @@ class TranslationEngine:
 
         # Serialize inference
         with self._lock:
-            # Double-check cache
             cached = self._cache.get(cache_key)
             if cached is not None:
-                log.debug("Cache hit inside lock (another thread translated while waiting)")
+                log.debug("Cache hit inside lock")
                 return cached
 
-            # Pre-process: normalise + inject IndicTrans2 language prefix.
-            processed = _preprocess(text, "eng_Latn", target_lang)
-
-            log.debug(f"Tokenising: {repr(processed[:120])}")
             t0 = time.monotonic()
-            tok_out = self._tokenizer(
-                processed,
-                return_tensors = "np",
-                padding        = True,
-                truncation     = True,
-                max_length     = MAX_INPUT_LEN,
-            )
-            input_ids      = tok_out["input_ids"].astype(np.int64)
-            attention_mask = tok_out["attention_mask"].astype(np.int64)
-            log.debug(f"Tokenisation done in {(time.monotonic()-t0)*1000:.0f}ms | input_ids shape: {input_ids.shape}")
 
-            # Encode
-            t0 = time.monotonic()
-            enc_out = self._encoder.run(
-                None,
-                {"input_ids": input_ids, "attention_mask": attention_mask},
-            )
-            encoder_hidden = enc_out[0]
-            log.debug(f"Encoder done in {(time.monotonic()-t0)*1000:.0f}ms | hidden shape: {encoder_hidden.shape}")
-
-            # Greedy autoregressive decode
-            eos_id = self._tokenizer.eos_token_id or 2
-            decoder_ids = np.array([[eos_id]], dtype=np.int64)
-            t0 = time.monotonic()
-            steps = 0
-
-            for _ in range(MAX_OUTPUT_LEN):
-                logits = self._decoder.run(
-                    None,
-                    {
-                        "decoder_input_ids":     decoder_ids,
-                        "encoder_hidden_states": encoder_hidden,
-                        "encoder_attention_mask": attention_mask,
-                    },
-                )[0]
-                next_id = int(np.argmax(logits[0, -1, :]))
-                steps += 1
-                if next_id == eos_id:
-                    break
-                decoder_ids = np.concatenate(
-                    [decoder_ids, np.array([[next_id]], dtype=np.int64)], axis=1
+            # Preserve newline structure — translate each line independently
+            # so multi-line messages (e.g. WhatsApp) map line-for-line.
+            raw_lines = text.splitlines()
+            translated_lines = []
+            for line in raw_lines:
+                line = line.strip()
+                if not line:
+                    translated_lines.append("")
+                    continue
+                # Within each line, split long sentences to avoid truncation.
+                sentences = (
+                    _split_for_translation(line)
+                    if len(line) > _SENTENCE_SPLIT_THRESHOLD
+                    else [line]
                 )
+                parts = [self._translate_sentence(s, target_lang) for s in sentences]
+                translated_lines.append(" ".join(parts))
 
-            decode_ms = (time.monotonic() - t0) * 1000
-            log.debug(f"Decoder done in {decode_ms:.0f}ms | {steps} steps | output tokens: {decoder_ids.shape[1]}")
-
-            raw = self._tokenizer.decode(decoder_ids[0], skip_special_tokens=True)
-            # Post-process: transliterate + restore dropped terminal punctuation.
-            result = _postprocess(raw, target_lang, source=text)
-
-        self._cache.put(cache_key, result)
+            result    = "\n".join(translated_lines)
+            total_ms  = (time.monotonic() - t0) * 1000
+            n_lines   = len(raw_lines)
+            self._cache.put(cache_key, result)
 
         log.info(
-            f"Translation complete | lang={target_lang} | "
-            f"input: {repr(text[:60])}{'...' if len(text) > 60 else ''} | "
-            f"output: {repr(result[:80])}{'...' if len(result) > 80 else ''} | "
-            f"decoder steps: {steps} | decode time: {decode_ms:.0f}ms"
-            + (f" | raw: {repr(raw[:60])}" if raw != result else "")
+            f"Translation complete | lang={target_lang} | {n_lines} line(s) | "
+            f"{total_ms:.0f}ms | input: {len(text)} chars | output: {len(result)} chars"
         )
         return result
+
+    def _translate_sentence(self, sentence: str, target_lang: str) -> str:
+        """Translate a single sentence using beam search with repetition penalty."""
+        processed = _preprocess(sentence, "eng_Latn", target_lang)
+        tok_out = self._tokenizer(
+            processed,
+            return_tensors="np",
+            padding=True,
+            truncation=True,
+            max_length=MAX_INPUT_LEN,
+        )
+        input_ids      = tok_out["input_ids"].astype(np.int64)
+        attention_mask = tok_out["attention_mask"].astype(np.int64)
+
+        enc_out = self._encoder.run(
+            None, {"input_ids": input_ids, "attention_mask": attention_mask}
+        )
+        encoder_hidden = enc_out[0]
+
+        eos_id     = self._tokenizer.eos_token_id or 2
+        output_ids = self._beam_decode(encoder_hidden, attention_mask, eos_id)
+
+        raw    = self._tokenizer.decode(output_ids, skip_special_tokens=True)
+        result = _postprocess(raw, target_lang, source=sentence)
+        return result
+
+    def _beam_decode(self, encoder_hidden: np.ndarray,
+                     attention_mask: np.ndarray, eos_id: int) -> list:
+        """Beam search with repetition penalty. Returns best token id list."""
+        # Each beam: [score (higher=better), token_ids]
+        beams     = [(0.0, [eos_id])]
+        completed = []
+
+        for _ in range(MAX_OUTPUT_LEN):
+            if not beams:
+                break
+            candidates = []
+            for score, ids in beams:
+                dec_ids = np.array([ids], dtype=np.int64)
+                logits  = self._decoder.run(None, {
+                    "decoder_input_ids":      dec_ids,
+                    "encoder_hidden_states":  encoder_hidden,
+                    "encoder_attention_mask": attention_mask,
+                })[0][0, -1, :].copy()       # (vocab_size,)
+
+                # Repetition penalty — downscale logits for already-seen tokens
+                for prev_id in set(ids[1:]):  # skip BOS
+                    if logits[prev_id] > 0:
+                        logits[prev_id] /= REPETITION_PENALTY
+                    else:
+                        logits[prev_id] *= REPETITION_PENALTY
+
+                # Stable log-softmax
+                logits -= logits.max()
+                log_probs = logits - np.log(np.exp(logits).sum())
+
+                # Expand with top NUM_BEAMS next tokens
+                top_ids = np.argpartition(log_probs, -NUM_BEAMS)[-NUM_BEAMS:]
+                for nid in top_ids:
+                    new_score = score + float(log_probs[nid])
+                    new_ids   = ids + [int(nid)]
+                    if int(nid) == eos_id:
+                        # Length-normalise so shorter beams don't dominate
+                        length        = max(len(new_ids) - 1, 1)
+                        normed_score  = new_score / (length ** 0.6)
+                        completed.append((normed_score, new_ids))
+                    else:
+                        candidates.append((new_score, new_ids))
+
+            # Prune to top NUM_BEAMS
+            candidates.sort(key=lambda x: -x[0])
+            beams = candidates[:NUM_BEAMS]
+
+            if len(completed) >= NUM_BEAMS:
+                break
+
+        if completed:
+            completed.sort(key=lambda x: -x[0])
+            return completed[0][1]
+        return beams[0][1] if beams else [eos_id]
 
     # ── Diagnostics ───────────────────────────────────────────────────────────
 
     def cache_info(self) -> dict:
-        """IMPROVE 10: expose hit/miss counters for debugging."""
         info = {
             "size":     len(self._cache),
             "max_size": CACHE_SIZE,
