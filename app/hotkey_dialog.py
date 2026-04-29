@@ -41,16 +41,7 @@ ERROR_BG    = "#FFF3F3"
 ERROR_BORD  = "#E8C0C0"
 ERROR_TEXT  = "#C0392B"
 
-_LANGUAGES = [
-    ("Hindi",     "hin_Deva"),
-    ("Bengali",   "ben_Beng"),
-    ("Marathi",   "mar_Deva"),
-    ("Telugu",    "tel_Telu"),
-    ("Tamil",     "tam_Taml"),
-    ("Kannada",   "kan_Knda"),
-    ("Punjabi",   "pan_Guru"),
-    ("Malayalam", "mal_Mlym"),
-]
+from utils import LANGUAGES as _LANGUAGES
 
 
 def _make_key_chip(label: str) -> QLabel:

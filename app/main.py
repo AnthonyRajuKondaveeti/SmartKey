@@ -23,6 +23,7 @@ import json
 import signal
 import threading
 import ctypes.wintypes
+import platform
 from collections import deque
 import time
 
@@ -41,7 +42,7 @@ def _root_dir() -> str:
 _HOTKEY_RE = re.compile(r'^(ctrl|shift|alt)(\+(ctrl|shift|alt))*\+[a-z0-9]$')
 
 from cache import appdata_dir
-from PyQt5.QtWidgets import QApplication, QMessageBox
+from PyQt5.QtWidgets import QApplication, QMessageBox, QWidget
 from PyQt5.QtCore    import QObject, pyqtSignal, QTimer, Qt, QAbstractNativeEventFilter
 from logger import log
 
@@ -78,32 +79,96 @@ except ImportError:
 
 class _PowerFilter(QAbstractNativeEventFilter):
     """
-    Listens for WM_POWERBROADCAST / PBT_APMRESUMEAUTOMATIC.
-    When Windows resumes from sleep the pynput keyboard hook is sometimes
-    silently dropped; calling on_resume() restarts the listener.
-    Rate-limited to once per 10 s to ignore duplicate resume events.
+    Listens for events that silently drop the pynput keyboard hook.
+
+    Covers three distinct scenarios:
+      1. Sleep/wake  — WM_POWERBROADCAST / PBT_APMRESUMEAUTOMATIC (timer/lid)
+      2. Sleep/wake  — WM_POWERBROADCAST / PBT_APMRESUMESUSPEND    (key press)
+      3. Session     — WM_WTSSESSION_CHANGE: screen unlock, Remote Desktop
+                       reconnect, Fast User Switching reconnect
+
+    All events are rate-limited to once per 10 s to suppress duplicate
+    messages Windows sometimes fires for a single resume.
     """
-    _WM_POWERBROADCAST      = 0x0218
-    _PBT_APMRESUMEAUTOMATIC = 0x0012
+    _WM_POWERBROADCAST       = 0x0218
+    _PBT_APMRESUMEAUTOMATIC  = 0x0012
+    _PBT_APMRESUMESUSPEND    = 0x0007
+    _POWER_RESUME_EVENTS     = {_PBT_APMRESUMEAUTOMATIC, _PBT_APMRESUMESUSPEND}
+
+    _WM_WTSSESSION_CHANGE    = 0x02B1
+    _WTS_SESSION_UNLOCK      = 8     # screen unlocked
+    _WTS_REMOTE_CONNECT      = 3     # Remote Desktop session reconnected
+    _WTS_CONSOLE_CONNECT     = 1     # Fast User Switching: session became active
+    _SESSION_RESUME_EVENTS   = {_WTS_SESSION_UNLOCK, _WTS_REMOTE_CONNECT, _WTS_CONSOLE_CONNECT}
 
     def __init__(self, on_resume):
         super().__init__()
-        self._on_resume   = on_resume
-        self._last_fired  = 0.0
+        self._on_resume  = on_resume
+        self._last_fired = 0.0
 
     def nativeEventFilter(self, event_type, message):
         if event_type == b"windows_generic_MSG":
             try:
                 msg = ctypes.wintypes.MSG.from_address(message.__int__())
-                if (msg.message == self._WM_POWERBROADCAST
-                        and msg.wParam == self._PBT_APMRESUMEAUTOMATIC):
+                should_resume = (
+                    (msg.message == self._WM_POWERBROADCAST
+                     and msg.wParam in self._POWER_RESUME_EVENTS)
+                    or
+                    (msg.message == self._WM_WTSSESSION_CHANGE
+                     and msg.wParam in self._SESSION_RESUME_EVENTS)
+                )
+                if should_resume:
                     now = time.monotonic()
                     if now - self._last_fired > 10.0:
                         self._last_fired = now
+                        log.info(
+                            f"Resume event msg={msg.message:#06x} wParam={msg.wParam:#06x} — "
+                            "restarting hotkey listener"
+                        )
                         self._on_resume()
             except Exception:
                 pass
         return False, 0
+
+
+class _SessionNotifier(QWidget):
+    """
+    Hidden widget whose HWND is registered with WTSRegisterSessionNotification.
+
+    Windows delivers WM_WTSSESSION_CHANGE to specific HWNDs; registering this
+    widget causes the messages to flow through Qt's event loop and therefore
+    through _PowerFilter.nativeEventFilter on the QApplication.
+    """
+
+    def __init__(self):
+        super().__init__()
+        # Keep zero size so it never appears on screen even if accidentally shown.
+        self.resize(0, 0)
+        self._registered = False
+
+    def register(self) -> None:
+        """
+        Register for session change notifications.
+        Must be called after the widget has a native HWND (winId()).
+        """
+        try:
+            _NOTIFY_FOR_THIS_SESSION = 0
+            hwnd = int(self.winId())
+            ok   = ctypes.windll.Wtsapi32.WTSRegisterSessionNotification(
+                hwnd, _NOTIFY_FOR_THIS_SESSION
+            )
+            self._registered = bool(ok)
+            log.debug(f"WTSRegisterSessionNotification: {'ok' if ok else 'failed'}")
+        except Exception as e:
+            log.debug(f"Session notification registration failed: {e}")
+
+    def unregister(self) -> None:
+        if self._registered:
+            try:
+                ctypes.windll.Wtsapi32.WTSUnRegisterSessionNotification(int(self.winId()))
+            except Exception:
+                pass
+            self._registered = False
 
 
 # ── Signal bridge ─────────────────────────────────────────────────────────────
@@ -122,6 +187,19 @@ _VALID_LANGS = {
     "hin_Deva", "ben_Beng", "mar_Deva", "tel_Telu",
     "tam_Taml", "kan_Knda", "pan_Guru", "mal_Mlym",
 }
+
+def _to_bool(value: object) -> bool:
+    """Strict boolean coercion for settings values.
+    Accepts actual booleans and common string representations.
+    Anything else returns False so hand-edited JSON never silently enables a mode."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        return value.lower() in ("true", "1", "yes", "on")
+    return False
+
 
 def _load_settings() -> dict:
     defaults = {"hotkey": "ctrl+alt+k", "default_lang": "hin_Deva", "automate": False, "translate": False}
@@ -147,8 +225,8 @@ def _load_settings() -> dict:
         if lang not in _VALID_LANGS:
             log.warning(f"Invalid default_lang in settings.json ({lang!r}) — using default")
             merged["default_lang"] = defaults["default_lang"]
-        merged["automate"]    = bool(merged.get("automate",   defaults["automate"]))
-        merged["translate"]   = bool(merged.get("translate",  defaults["translate"]))
+        merged["automate"]  = _to_bool(merged.get("automate",  defaults["automate"]))
+        merged["translate"] = _to_bool(merged.get("translate", defaults["translate"]))
         return merged
     except Exception as e:
         log.warning(f"Could not load settings.json: {e} — using defaults")
@@ -174,10 +252,12 @@ class SmartKeyboardApp:
         self._bridge       = _Bridge()
         self._popup                = None
         self._popup_hidden_for_focus = False
-        self._power_filter           = None
-        self._enabled              = True
+        self._power_filter    = None
+        self._session_notifier = None
+        self._enabled         = True
         self._listener             = None
         self._target_hwnd          = 0
+        self._hotkey_time          = 0.0   # monotonic timestamp of last hotkey press
         self._bridge.hotkey_fired.connect(self._show_popup, Qt.QueuedConnection)
         self._popup_history = deque(maxlen=5)
         # QueuedConnection: slot is posted to the main event-loop queue, so it
@@ -186,10 +266,10 @@ class SmartKeyboardApp:
         self._bridge.text_captured.connect(self._on_text_captured, Qt.QueuedConnection)
         self._bridge.show_hk_dialog.connect(self._open_hotkey_dialog, Qt.QueuedConnection)
 
-        # Focus monitor — hide popup when another app takes focus, restore when target returns
+        # Focus monitor — started when a popup is created, stopped when it is destroyed.
+        # Not running when no popup exists avoids 2 timer callbacks/second indefinitely.
         self._focus_timer = QTimer()
         self._focus_timer.timeout.connect(self._check_focus)
-        self._focus_timer.start(500)
         self._translation_engine = TranslationEngine(model_dir=self.MODEL_DIR)
         self._grammar_engine     = GrammarEngine(model_dir=self.GRAMMAR_DIR)
         self._tone_engine        = None   # tone fine-tuning in progress — not loaded
@@ -199,6 +279,31 @@ class SmartKeyboardApp:
         self._last_target_rect   = None
 
     def run(self):
+        log.info(
+            f"Smart Keyboard v{__import__('version').__version__} | "
+            f"Windows {platform.version()} | "
+            f"CPUs {os.cpu_count()} | "
+            f"Python {sys.version.split()[0]}"
+        )
+
+        # ── Fix 2-alt: warn if running from a user-writable location ─────────
+        if getattr(sys, "frozen", False):
+            install_dir  = _root_dir()
+            prog_files   = os.environ.get("ProgramFiles", "")
+            prog_files86 = os.environ.get("ProgramFiles(x86)", "")
+            if prog_files and prog_files86:
+                if not (install_dir.startswith(prog_files) or
+                        install_dir.startswith(prog_files86)):
+                    log.warning(
+                        f"App running from user-writable path: {install_dir} — "
+                        "install to %ProgramFiles% to prevent model-directory tampering"
+                    )
+
+        # ── Fix 3: first-run model check — block until files present ─────────
+        from setup_wizard import run_setup_if_needed
+        if not run_setup_if_needed(self.MODEL_DIR, self.GRAMMAR_DIR):
+            sys.exit(0)
+
         self._tray = TrayManager(
             on_toggle        = self._on_tray_toggle,
             on_quit          = self._quit,
@@ -210,6 +315,13 @@ class SmartKeyboardApp:
 
         self._power_filter = _PowerFilter(self._on_system_resume)
         self._app.installNativeEventFilter(self._power_filter)
+
+        # Register for session-change notifications (screen unlock, Remote
+        # Desktop reconnect, Fast User Switching).  _SessionNotifier is a
+        # hidden QWidget — its HWND is used for WTSRegisterSessionNotification
+        # so WM_WTSSESSION_CHANGE messages reach _PowerFilter via Qt's loop.
+        self._session_notifier = _SessionNotifier()
+        self._session_notifier.register()
 
         self._grammar_engine.load(
             on_ready = lambda: self._on_model_ready("grammar"),
@@ -345,6 +457,9 @@ class SmartKeyboardApp:
         if self._power_filter:
             self._app.removeNativeEventFilter(self._power_filter)
             self._power_filter = None
+        if self._session_notifier:
+            self._session_notifier.unregister()
+            self._session_notifier = None
         for engine in (self._translation_engine, self._grammar_engine, self._tone_engine):
             if engine and hasattr(engine, "_executor"):
                 engine._executor.shutdown(wait=False)
@@ -364,6 +479,7 @@ class SmartKeyboardApp:
         if not self._enabled:
             log.debug("Hotkey fired but app is disabled — skipped")
             return
+        self._hotkey_time = time.monotonic()
         hwnd = get_foreground_hwnd()
         if hwnd not in self._own_hwnds():
             self._target_hwnd = hwnd   # only update when a foreign window is active
@@ -378,7 +494,8 @@ class SmartKeyboardApp:
             except Exception as e:
                 log.exception(f"Selection capture failed: {e}")
                 selected = ""
-            log.info(f"Text captured | length: {len(selected)}")
+            elapsed = (time.monotonic() - self._hotkey_time) * 1000
+            log.info(f"Text captured | {len(selected)} chars | {elapsed:.0f}ms since hotkey")
             self._bridge.text_captured.emit(selected)
 
         threading.Thread(target=_capture, daemon=True, name="TextCapture").start()
@@ -439,6 +556,14 @@ class SmartKeyboardApp:
         self._popup.set_grammar_engine(self._grammar_engine)
         self._popup.set_translation_engine(self._translation_engine)
         self._popup.set_tone_engine(self._tone_engine)
+
+        def _on_popup_destroyed():
+            self._popup = None
+            self._focus_timer.stop()
+
+        self._popup.destroyed.connect(_on_popup_destroyed)
+        if not self._focus_timer.isActive():
+            self._focus_timer.start(500)
 
         if self._automate:
             if rect:

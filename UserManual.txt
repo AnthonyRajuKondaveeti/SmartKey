@@ -1,0 +1,156 @@
+================================================================
+  SMART KEYBOARD  v1.0.0  —  User Manual
+================================================================
+
+WHAT IS SMART KEYBOARD?
+------------------------
+Smart Keyboard is a desktop tool that sits quietly in your
+system tray and helps you fix grammar or translate text into
+Indian languages — without leaving whatever app you are using.
+
+Select any text, press a hotkey, and Smart Keyboard instantly
+shows a popup with the corrected or translated result. One more
+click pastes it back.
+
+
+GETTING STARTED
+---------------
+1. Double-click SmartKeyboard.exe to launch the app.
+
+2. You will see a keyboard icon appear in the system tray
+   (bottom-right corner of your screen, near the clock).
+
+3. That's it — the app is running in the background.
+
+
+HOW TO USE IT
+-------------
+1. Open any app (Word, browser, WhatsApp Web, Notepad, etc.)
+
+2. Select the text you want to fix or translate.
+
+3. Press  Ctrl + Alt + K  (the default hotkey).
+
+4. A popup appears with your selected text already loaded.
+
+5. Click  "Fix Grammar"  or  "Translate"  to process it.
+
+6. Review the result, then click  "Paste"  to replace your
+   original text automatically.
+
+
+GRAMMAR vs TRANSLATE MODE
+--------------------------
+Inside the popup, you can switch between two modes:
+
+  Grammar   — Fixes spelling, grammar, and sentence structure.
+              Works best with English text.
+
+  Translate — Translates text into your chosen Indian language
+              (Hindi, Telugu, Tamil, Bengali, and more).
+
+The mode you last used is remembered the next time you open
+the popup.
+
+
+CHANGING SETTINGS
+-----------------
+Right-click the tray icon  →  select "Settings"
+
+From Settings you can change:
+
+  Default Language  — The language Translate mode uses by default.
+                      You can still change it per-session inside
+                      the popup as well.
+
+  Hotkey            — Click inside the capture box and press your
+                      preferred key combination. Must include at
+                      least one of  Ctrl / Shift / Alt  plus a
+                      letter or number.
+                      Example: Ctrl+Shift+H
+
+  Automate Mode     — When ON, the app processes your selected text
+                      immediately on hotkey press and pastes the
+                      result without showing the full popup.
+                      A small circle appears — click it to review
+                      or undo the change.
+                      When OFF (default), the popup always opens
+                      so you can review before pasting.
+
+Click  Save  to apply.
+
+
+SUPPORTED LANGUAGES
+-------------------
+  Hindi       Bengali     Marathi     Telugu
+  Tamil       Kannada     Punjabi     Malayalam
+
+
+AUTOMATE MODE — QUICK GUIDE
+----------------------------
+1. Enable Automate Mode in Settings.
+2. Select text in any app and press the hotkey.
+3. The text is fixed/translated and pasted back instantly.
+4. A small circle appears on screen — click it to see what
+   changed or to undo.
+
+
+QUITTING THE APP
+----------------
+Right-click the tray icon  →  select "Quit"
+
+The app does not appear in the taskbar — it only lives in
+the system tray. If you cannot find the tray icon, click the
+small arrow ( ^ ) near the clock to show hidden icons.
+
+
+TIPS
+----
+- The popup closes automatically when you click away.
+  Press the hotkey again to reopen it.
+
+- You can change the language inside the popup for a single
+  session without touching Settings.
+
+- If the popup does not appear, make sure the app is still
+  running (check the system tray).
+
+- The app starts only when you launch SmartKeyboard.exe.
+  If you want it to start with Windows, enable that option
+  in Settings.
+
+
+TROUBLESHOOTING
+---------------
+Hotkey not working?
+  → Another app may be using the same hotkey.
+    Change it in Settings (right-click tray icon).
+
+Popup appears but processing fails?
+  → The AI models may not have loaded yet.
+    Wait a few seconds after launch and try again.
+
+Text not pasting automatically?
+  → Click inside the target app first to give it focus,
+    then press the hotkey.
+
+App not visible in tray?
+  → Click the  ^  arrow near the clock to show hidden icons.
+    You may need to drag the Smart Keyboard icon out to keep
+    it always visible.
+
+
+================================================================
+  DEVELOPED BY
+================================================================
+
+  Anthony Raju Kondaveeti
+
+  GitHub    :  https://github.com/AnthonyRajuKondaveeti
+  Website   :  https://anthonyrajukondaveeti.github.io/
+  LinkedIn  :  https://www.linkedin.com/in/anthony-raju-kondaveeti-855978281/
+  Email     :  tonykondaveetijmj98@gmail.com
+
+  Feel free to reach out for questions, feedback, or support.
+
+================================================================

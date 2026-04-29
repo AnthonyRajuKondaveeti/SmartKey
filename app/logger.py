@@ -16,9 +16,10 @@ Usage anywhere in the app:
 import logging
 import os
 from logging.handlers import RotatingFileHandler
+from cache import appdata_dir
 
-# ── Log directory ─────────────────────────────────────────────────────────────
-_LOG_DIR  = os.path.join(os.path.dirname(__file__), "..", "logs")
+# ── Log directory — use appdata so path is correct in both dev and .exe bundle ─
+_LOG_DIR  = os.path.join(appdata_dir(), "logs")
 os.makedirs(_LOG_DIR, exist_ok=True)
 _LOG_FILE = os.path.join(_LOG_DIR, "smart_keyboard.log")
 

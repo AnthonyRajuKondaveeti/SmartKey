@@ -135,10 +135,14 @@ def start_hotkey_listener(
             self._inner = inner
             self._q     = q
         def stop(self):
+            # Drain any pending trigger so the sentinel always lands.
+            # If the queue is full (a trigger is waiting), discard it —
+            # the hotkey is being torn down so that trigger should not fire.
             try:
-                self._q.put_nowait(None)   # wake worker so it can exit
-            except queue.Full:
+                self._q.get_nowait()
+            except queue.Empty:
                 pass
+            self._q.put(None)   # blocking put; worker will exit after current task
             self._inner.stop()
 
     inner = keyboard.Listener(on_press=_on_press, on_release=_on_release)

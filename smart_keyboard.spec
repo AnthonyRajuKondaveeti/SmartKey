@@ -7,14 +7,9 @@
 #
 # Output: dist/SmartKeyboard/SmartKeyboard.exe  (--onedir bundle)
 #
-# MODELS (not bundled — too large at ~1.5 GB):
-#   After building, copy your models folder next to the exe:
-#     dist/SmartKeyboard/models/indictrans2/
-#     dist/SmartKeyboard/models/grammar/
-#     dist/SmartKeyboard/models/tone/hin/
-#
-# UPDATING:
-#   Bump APP_VERSION below, rebuild, re-package MSIX, submit to Partner Center.
+# MODELS (not bundled — ship separately, placed by build_release.bat):
+#   dist/SmartKeyboard/models/indictrans2/
+#   dist/SmartKeyboard/models/grammar/coedit-small_int8/  (decoder_with_past_model.onnx excluded)
 
 import sys
 from PyInstaller.utils.hooks import collect_all, collect_data_files
@@ -69,7 +64,6 @@ a = Analysis(
         "PyQt5.QtCore",
         "PyQt5.QtGui",
         "PyQt5.sip",
-        "sip",                      # older PyQt5 versions expose bare sip
         # pynput Windows backend
         "pynput.keyboard._win32",
         "pynput.mouse._win32",
@@ -94,24 +88,58 @@ a = Analysis(
     # Tell PyInstaller not to follow optional imports it cannot satisfy.
     # selenium: imported optionally by transformers test utilities.
     # torch / tf / flax: transformers checks for them at runtime but we use ONNX.
+    # lxml: HTML parser pulled in by transformers extras, not used in our code path.
+    # safetensors: PyTorch weight format loader, we use ONNX only.
+    # tkinter: stdlib GUI toolkit, not used (app uses PyQt5).
     excludes=[
         "selenium", "torch", "torchvision", "tensorflow", "flax",
         "jax", "sklearn", "scipy", "pandas", "matplotlib",
         "IPython", "notebook", "jupyter", "sacrebleu", "sacremoses",
+        "lxml", "safetensors", "tkinter", "_tkinter",
+        "onnx",           # model conversion tool — runtime uses onnxruntime only
+        "google",         # protobuf — pulled in by onnx, not needed at runtime
+        "setuptools",     # package manager — never needed at runtime
+        "markupsafe",     # jinja2 dep — jinja2 is already excluded
     ],
     hookspath=[],
     noarchive=False,
     optimize=1,
 )
 
-# ── Remove unused large packages to shrink bundle size ───────────────────────
-EXCLUDES = {
+# ── Strip unused files from collected outputs ────────────────────────────────
+
+# Packages with no runtime role in this app
+_PKG_STRIP = {
     "matplotlib", "scipy", "pandas", "sklearn", "tensorflow", "torch",
     "torchvision", "jinja2", "IPython", "notebook", "jupyter",
-    "sacrebleu", "sacremoses",
+    "sacrebleu", "sacremoses", "lxml", "safetensors",
+    "onnx", "google", "markupsafe",
 }
-a.binaries  = [x for x in a.binaries  if x[0].split(".")[0] not in EXCLUDES]
-a.datas     = [x for x in a.datas     if x[0].split(".")[0] not in EXCLUDES]
+a.binaries = [x for x in a.binaries if x[0].split(".")[0] not in _PKG_STRIP]
+a.datas    = [x for x in a.datas    if x[0].split(".")[0] not in _PKG_STRIP]
+
+# Tkinter / Tcl / Tk — not used (PyQt5 app)
+_TCL_TOKENS = ("_tcl_data", "_tk_data", "tcl8", "tcl86", "tk86", "_tkinter", "tkinter")
+a.binaries = [x for x in a.binaries if not any(t in x[0].lower() for t in _TCL_TOKENS)]
+a.datas    = [x for x in a.datas    if not any(t in x[0].lower() for t in _TCL_TOKENS)]
+
+# Qt5 translation files (~5 MB) — English-only UI needs none of these
+a.datas = [x for x in a.datas
+           if "translations" not in x[0].replace("\\", "/").lower()]
+
+# Transformers model architecture files we don't use (~30 MB).
+# AutoTokenizer only needs: auto/, t5/ (grammar), albert/ (tone).
+# All other architecture subdirectories are dead code in this app.
+_KEEP_TRANS_MODELS = {"auto", "t5", "albert", ""}
+def _keep_trans_data(entry):
+    name = entry[0].replace("\\", "/")
+    if "transformers/models/" not in name:
+        return True
+    after_models = name.split("transformers/models/", 1)[1]
+    subdir = after_models.split("/")[0]
+    return subdir in _KEEP_TRANS_MODELS
+
+a.datas = [x for x in a.datas if _keep_trans_data(x)]
 
 pyz = PYZ(a.pure)
 

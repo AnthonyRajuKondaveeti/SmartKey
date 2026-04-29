@@ -12,6 +12,7 @@ from PyQt5.QtCore import Qt, QTimer, QEvent, QPoint
 from PyQt5.QtGui import QFont, QCursor, QColor, QRegion
 from logger import log
 from tone import TONE_MAX_CHARS
+from utils import LANGUAGES as _LANGUAGES, is_english_input
 
 # ── Palette ───────────────────────────────────────────────────────────────────
 BG_COLOR      = "#FBFBFB"
@@ -25,24 +26,6 @@ SUCCESS_SAND  = "#435B4E"
 
 _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
-def _is_english_input(text: str) -> bool:
-    alpha = [c for c in text if c.isalpha()]
-    if not alpha:
-        return True
-    non_latin = sum(1 for c in alpha if ord(c) > 0x024F)
-    return non_latin / len(alpha) < 0.10
-
-
-_LANGUAGES = [
-    ("Hindi",     "hin_Deva"),
-    ("Bengali",   "ben_Beng"),
-    ("Marathi",   "mar_Deva"),
-    ("Telugu",    "tel_Telu"),
-    ("Tamil",     "tam_Taml"),
-    ("Kannada",   "kan_Knda"),
-    ("Punjabi",   "pan_Guru"),
-    ("Malayalam", "mal_Mlym"),
-]
 
 
 # ── Floating circle (separate top-level window, no setWindowFlags changes) ────
@@ -169,11 +152,12 @@ class SmartKeyboardPopup(QWidget):
         self._grammar_engine        = None
         self._tone_engine           = None
         self._process_start_time    = 0.0
-        self._result_queue          = queue.Queue()
-        self._pending_notice        = None
-        self._drag_pos              = None
-        self._history               = history if history is not None else deque(maxlen=5)
-        self._automate              = automate
+        self._result_queue              = queue.Queue()
+        self._pending_grammar_future    = None   # Future for in-flight grammar job
+        self._pending_translation_future = None  # Future for in-flight translation job
+        self._drag_pos                  = None
+        self._history                   = history if history is not None else deque(maxlen=5)
+        self._automate                  = automate
 
         self._build_ui()
         self._apply_styles()
@@ -360,6 +344,9 @@ class SmartKeyboardPopup(QWidget):
         self._output_box.setPlaceholderText("Refined text will appear here...")
         self._output_box.setFixedHeight(80)
         self._output_box.setReadOnly(True)
+        # Nirmala UI ships with Windows 8+ and covers all 8 supported Indic scripts,
+        # preventing the "OpenType support missing for script 17" Qt warnings.
+        self._output_box.setFont(QFont("Nirmala UI", 13))
         layout.addWidget(self._output_box)
 
         # ── Paste button (manual mode only) ──────────────────────────────────────
@@ -728,6 +715,7 @@ class SmartKeyboardPopup(QWidget):
     def set_selected_text(self, text):
         self._processing = False
         self._job_seq += 1   # invalidate any in-flight job
+        self._cancel_pending_futures()
         self._input_box.setPlainText(text)
         self._output_box.clear()
         self._copy_btn.setEnabled(False)
@@ -777,7 +765,7 @@ class SmartKeyboardPopup(QWidget):
         if not text:
             return
 
-        if not _is_english_input(text):
+        if not is_english_input(text):
             self._output_box.setPlainText(
                 "Input must be in English.\n"
                 "This pipeline only processes Latin-script text."
@@ -816,33 +804,61 @@ class SmartKeyboardPopup(QWidget):
                 )
                 return
 
+        self._cancel_pending_futures()
         self._processing = True
         self._job_seq += 1
         self._process_start_time = time.monotonic()
         self._process_btn.setEnabled(False)
         self._process_btn.setText("WORKING...")
         self._tone_status_label.setVisible(False)
+        mode = "translate" if self._translation_enabled else "grammar"
+        log.info(f"Pipeline start | mode={mode} | lang={self._target_lang} | {len(text)} chars")
         if self._translation_enabled:
             self._run_translation(text)
         else:
             self._run_grammar(text)
 
+    def _cancel_pending_futures(self):
+        """Cancel any queued (not yet running) grammar or translation futures."""
+        for f in (self._pending_grammar_future, self._pending_translation_future):
+            if f is not None and not f.done():
+                f.cancel()
+        self._pending_grammar_future    = None
+        self._pending_translation_future = None
+
     def _run_translation(self, text):
         lang = self._target_lang
+        t0   = self._process_start_time
         if self._grammar_engine and self._grammar_engine.is_ready:
-            self._grammar_engine.correct(
+            log.info(f"Pipeline | grammar stage starting | {len(text)} chars")
+            def _on_grammar_done(corrected):
+                log.info(
+                    f"Pipeline | grammar done | "
+                    f"{(time.monotonic()-t0)*1000:.0f}ms cumulative | "
+                    f"translation starting"
+                )
+                self._do_translate(corrected or text, lang, t0)
+            self._pending_grammar_future = self._grammar_engine.correct(
                 text,
-                on_result=lambda c: self._do_translate(c or text, lang),
-                on_error=lambda _: self._do_translate(text, lang),
+                on_result=_on_grammar_done,
+                on_error=lambda _: self._do_translate(text, lang, t0),
             )
         else:
-            self._do_translate(text, lang)
+            log.info("Pipeline | grammar skipped (not ready) | translation starting")
+            self._do_translate(text, lang, t0)
 
-    def _do_translate(self, text, target_lang="hin_Deva"):
+    def _do_translate(self, text, target_lang="hin_Deva", t_pipeline=None):
         if not self._translation_engine:
             return
 
+        t0 = t_pipeline or self._process_start_time
+
         def _on_translated(translated_text):
+            log.info(
+                f"Pipeline | translation done | "
+                f"{(time.monotonic()-t0)*1000:.0f}ms cumulative | "
+                f"{len(translated_text)} chars out"
+            )
             persona = self._current_relationship
             if (
                 target_lang == "hin_Deva"
@@ -856,41 +872,39 @@ class SmartKeyboardPopup(QWidget):
                     default=len(translated_text),
                 )
                 if max_line > TONE_MAX_CHARS:
-                    self._pending_notice = ("TEXT TOO LONG — TONE SKIPPED", "warn")
+                    notice = ("TEXT TOO LONG — TONE SKIPPED", "warn")
                 else:
-                    self._pending_notice = (f"TONE: {persona_name.upper()}", "ok")
+                    notice = (f"TONE: {persona_name.upper()}", "ok")
+                log.info(f"Pipeline | tone stage starting | persona={persona_name}")
                 self._tone_engine.apply(
                     translated_text,
                     persona_idx=persona,
-                    on_result=self._on_bg_result,
-                    on_error=lambda _: self._on_bg_result(translated_text),
+                    on_result=lambda t, n=notice: self._on_bg_result(t, n),
+                    on_error=lambda _, n=notice: self._on_bg_result(translated_text, None),
                 )
             else:
-                self._pending_notice = None
-                self._on_bg_result(translated_text)
+                self._on_bg_result(translated_text, None)
 
-        self._translation_engine.translate(
+        self._pending_translation_future = self._translation_engine.translate(
             text=text,
             target_lang=target_lang,
             on_result=_on_translated,
-            on_error=self._on_bg_error,
+            on_error=lambda msg: self._on_bg_result(f"Error: {msg}", None),
         )
 
     def _run_grammar(self, text):
         if not self._grammar_engine:
             self._on_bg_error("Grammar engine not available")
             return
-        self._grammar_engine.correct(
+        self._pending_grammar_future = self._grammar_engine.correct(
             text=text,
-            on_result=self._on_bg_result,
+            on_result=lambda t: self._on_bg_result(t, None),
             on_error=self._on_bg_error,
         )
 
     # ── Background result callbacks ───────────────────────────────────────────
 
-    def _on_bg_result(self, output):
-        notice = self._pending_notice
-        self._pending_notice = None
+    def _on_bg_result(self, output, notice):
         self._result_queue.put((output, notice, self._job_seq))
         QTimer.singleShot(0, self._flush_pending_output)
 
@@ -909,6 +923,12 @@ class SmartKeyboardPopup(QWidget):
         if not out:
             return
 
+        total_ms = (time.monotonic() - self._process_start_time) * 1000
+        status   = "error" if out.startswith("Error:") else "ok"
+        log.info(
+            f"Pipeline done | {total_ms:.0f}ms total | "
+            f"status={status} | {len(out)} chars out"
+        )
         self._output_box.setPlainText(out)
         self._copy_btn.setEnabled(True)
         self._reset_process_btn()
@@ -943,7 +963,7 @@ class SmartKeyboardPopup(QWidget):
             if self._automate:
                 # Automate mode: paste immediately, no button needed.
                 # Uses `out` directly so the truncation notice is never included.
-                QTimer.singleShot(80, lambda: self._on_paste(out, self._on_auto_paste_result))
+                QTimer.singleShot(30, lambda: self._on_paste(out, self._on_auto_paste_result))
             else:
                 # Manual mode: let the user decide when to paste.
                 self._paste_btn.setEnabled(True)
@@ -1034,6 +1054,12 @@ class SmartKeyboardPopup(QWidget):
             if self.windowState() & Qt.WindowMinimized:
                 self.setWindowState(Qt.WindowNoState)
         super().changeEvent(event)
+
+    def closeEvent(self, event):
+        if self._circle_win is not None:
+            self._circle_win.close_permanently()
+            self._circle_win = None
+        super().closeEvent(event)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:

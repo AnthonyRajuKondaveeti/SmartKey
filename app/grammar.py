@@ -19,13 +19,11 @@ Generation: greedy autoregressive decode (start=pad_id=0, stop=eos_id=1).
 import os
 import re
 import time
-import threading
 import unicodedata
-import concurrent.futures
 import numpy as np
 from typing import Callable, List, Optional, Tuple
 from logger import log
-from cache import LRUCache
+from engine_base import BaseEngine
 from utils import ABBREV_RE
 
 
@@ -125,7 +123,7 @@ _ORT_THREADS = min(max(1, (os.cpu_count() or 4)), 8)
 
 # ── GrammarEngine ─────────────────────────────────────────────────────────────
 
-class GrammarEngine:
+class GrammarEngine(BaseEngine):
     """
     Manages grammar correction model lifecycle and correction requests.
 
@@ -136,54 +134,20 @@ class GrammarEngine:
     """
 
     def __init__(self, model_dir: str = "models/grammar"):
-        self._base_dir     = model_dir
-        self._tokenizer    = None
-        self._encoder      = None
-        self._decoder      = None
-        self._prefix       = COEDIT_PREFIX
-        self._active_model = None
-        self._cache            = LRUCache("grammar", CACHE_SIZE)
-        self._ready            = threading.Event()
-        self._failed           = False
-        self._load_called      = False
-        self._lock             = threading.Lock()
-        self._prefix_token_len = 0   # set after tokenizer loads; used to tighten max_length
-        self._executor         = concurrent.futures.ThreadPoolExecutor(
-            max_workers=2, thread_name_prefix="GrammarEngine"
+        super().__init__(
+            cache_namespace = "grammar",
+            cache_size      = CACHE_SIZE,
+            thread_prefix   = "GrammarEngine",
+            load_timeout    = LOAD_TIMEOUT,
         )
+        self._base_dir         = model_dir
+        self._tokenizer        = None
+        self._encoder          = None
+        self._decoder          = None
+        self._prefix           = COEDIT_PREFIX
+        self._active_model     = None
+        self._prefix_token_len = 0
         log.debug(f"GrammarEngine created | base_dir={model_dir}")
-
-    # ── Loading ───────────────────────────────────────────────────────────────
-
-    def load(
-        self,
-        on_ready: Optional[Callable[[], None]] = None,
-        on_error: Optional[Callable[[str], None]] = None,
-    ) -> None:
-        """Load model on a background thread (primary → fallback)."""
-        self._load_called = True
-        log.info("GrammarEngine load requested — starting background thread")
-
-        def _load():
-            t_start = time.monotonic()
-            try:
-                self._load_model()
-                elapsed = (time.monotonic() - t_start) * 1000
-                self._ready.set()
-                log.info(
-                    f"GrammarEngine ready | model: {self._active_model} | "
-                    f"prefix: {repr(self._prefix)} | loaded in {elapsed:.0f}ms"
-                )
-                if on_ready:
-                    on_ready()
-            except Exception as e:
-                elapsed = (time.monotonic() - t_start) * 1000
-                log.error(f"GrammarEngine load failed after {elapsed:.0f}ms: {e}")
-                self._failed = True
-                if on_error:
-                    on_error(str(e))
-
-        threading.Thread(target=_load, daemon=True, name="GrammarEngine-Load").start()
 
     def _load_model(self) -> None:
         import onnxruntime as ort
@@ -251,14 +215,6 @@ class GrammarEngine:
         )
 
     @property
-    def is_ready(self) -> bool:
-        return self._ready.is_set()
-
-    @property
-    def is_failed(self) -> bool:
-        return self._failed
-
-    @property
     def active_model(self) -> Optional[str]:
         """Subdir name of the loaded model, or None until ready."""
         return self._active_model
@@ -270,11 +226,14 @@ class GrammarEngine:
         text: str,
         on_result: Callable[[str], None],
         on_error:  Optional[Callable[[str], None]] = None,
-    ) -> None:
+    ):
         """
         Grammar-correct `text` asynchronously.
         on_result(corrected_text) called on a background thread when done.
         on_error(msg) called on failure.
+
+        Returns the submitted Future — caller may call .cancel() to abort
+        a queued (not yet running) job.
         """
         log.info(f"Grammar correct requested | {len(text)} chars")
 
@@ -286,7 +245,7 @@ class GrammarEngine:
                 if on_error:
                     on_error(str(e))
 
-        self._executor.submit(_run)
+        return self._executor.submit(_run)
 
     # ── Sentence splitting ────────────────────────────────────────────────────
 
@@ -387,16 +346,7 @@ class GrammarEngine:
             return cached
 
         log.debug(f"Grammar cache MISS ({self._cache.misses} misses so far)")
-
-        if not self._load_called:
-            raise RuntimeError(
-                "GrammarEngine.load() was never called. "
-                "Call engine.load() at app startup before correcting."
-            )
-        if not self._ready.wait(timeout=LOAD_TIMEOUT):
-            raise RuntimeError(
-                f"Grammar model did not finish loading within {LOAD_TIMEOUT}s."
-            )
+        self._wait_ready()
 
         # Correct line-by-line so \n boundaries are preserved in the output.
         # Within each line, _split_sentences handles long clauses as before.
@@ -404,26 +354,40 @@ class GrammarEngine:
         raw_lines = text.splitlines()
         corrected_lines = []
         total_sentences = 0
+        bypassed = 0
         for line in raw_lines:
             if not line.strip():
                 corrected_lines.append(line)
                 continue
             sentences = self._split_sentences(line)
             total_sentences += len(sentences)
+            bypassed += sum(1 for s in sentences if len(s) < self._SHORT_BYPASS_CHARS)
             corrected_lines.append(" ".join(self._correct_single(s) for s in sentences))
         result = "\n".join(corrected_lines)
 
         total_ms = (time.monotonic() - t_total) * 1000
+        inferred = total_sentences - bypassed
         log.info(
-            f"Grammar done in {total_ms:.0f}ms | {total_sentences} sentence(s) | "
+            f"Grammar done in {total_ms:.0f}ms | {total_sentences} sentence(s) "
+            f"({inferred} inferred, {bypassed} bypassed) | "
             f"model: {self._active_model} | input: {len(text)} chars | output: {len(result)} chars"
         )
 
         self._cache.put(text, result)
         return result
 
+    # Sentences shorter than this skip the model entirely — they're greetings,
+    # one-word fragments, or already-correct short phrases that don't justify
+    # a full encode+decode pass (~300ms each).
+    _SHORT_BYPASS_CHARS = 20
+
     def _correct_single(self, sentence: str) -> str:
         """Run inference on one sentence. Serialized via _lock; result cached."""
+        # Short-sentence bypass — no model pass needed.
+        if len(sentence) < self._SHORT_BYPASS_CHARS:
+            log.debug(f"Grammar bypass (short): {len(sentence)} chars")
+            return sentence
+
         # Sentence-level cache hit (avoids re-running the same sentence seen in
         # a different paragraph)
         cached = self._cache.get(sentence)

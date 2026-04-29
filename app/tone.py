@@ -21,12 +21,10 @@ UI chip → persona mapping (chip index matches _PERSONA_DEFS order):
 import os
 import re
 import time
-import threading
-import concurrent.futures
 import numpy as np
 from typing import Callable, Optional
 from logger import log
-from cache import LRUCache
+from engine_base import BaseEngine
 
 # UI chip order → (label, decoder_file, prefix_row_in_npy)
 # Row order in .npy fixed by training: {0:mother, 1:stranger, 2:friend, 3:gf_wife}
@@ -99,55 +97,27 @@ def _postprocess(text: str, fallback: str, source: str = "") -> str:
     return result or fallback
 
 
-class ToneEngine:
+class ToneEngine(BaseEngine):
     """Applies persona tone to Hindi text using shared encoder + persona decoders."""
 
     def __init__(self, model_dir: str = "models/tone/hin"):
-        self._model_dir   = model_dir
-        self._tokenizer   = None
-        self._encoder     = None
-        self._decoders    = {}    # persona_idx → ort.InferenceSession
-        self._prefixes    = None  # np.ndarray shape (4, 24, 1024)
-        self._bos_id      = None  # <2hi> token id — required decoder start token
-        self._stop_ids    = set()
-        self._cache          = LRUCache("tone", CACHE_SIZE)
-        self._ready          = threading.Event()
-        self._failed         = False
-        self._load_called    = False
-        self._lock           = threading.Lock()
-        self._prefix_slices  = None   # list[np.ndarray], populated at load time
-        self._executor       = concurrent.futures.ThreadPoolExecutor(
-            max_workers=2, thread_name_prefix="ToneEngine"
+        super().__init__(
+            cache_namespace = "tone",
+            cache_size      = CACHE_SIZE,
+            thread_prefix   = "ToneEngine",
+            load_timeout    = LOAD_TIMEOUT,
         )
+        self._model_dir     = model_dir
+        self._tokenizer     = None
+        self._encoder       = None
+        self._decoders      = {}     # persona_idx → ort.InferenceSession
+        self._prefixes      = None   # np.ndarray shape (4, 24, 1024)
+        self._bos_id        = None
+        self._stop_ids      = set()
+        self._prefix_slices = None
         log.debug(f"ToneEngine created | model_dir={model_dir}")
 
-    def load(
-        self,
-        on_ready: Optional[Callable[[], None]] = None,
-        on_error: Optional[Callable[[str], None]] = None,
-    ) -> None:
-        self._load_called = True
-        log.info("ToneEngine load requested — starting background thread")
-
-        def _load():
-            t_start = time.monotonic()
-            try:
-                self._load_models()
-                elapsed = (time.monotonic() - t_start) * 1000
-                self._ready.set()
-                log.info(f"ToneEngine ready in {elapsed:.0f}ms")
-                if on_ready:
-                    on_ready()
-            except Exception as e:
-                elapsed = (time.monotonic() - t_start) * 1000
-                log.error(f"ToneEngine load failed after {elapsed:.0f}ms: {e}")
-                self._failed = True
-                if on_error:
-                    on_error(str(e))
-
-        threading.Thread(target=_load, daemon=True, name="ToneEngine-Load").start()
-
-    def _load_models(self) -> None:
+    def _load_model(self) -> None:
         if not os.path.isdir(self._model_dir):
             raise FileNotFoundError(f"Tone model dir not found: {self._model_dir}")
 
@@ -193,14 +163,6 @@ class ToneEngine:
             t0 = time.monotonic()
             self._decoders[idx] = ort.InferenceSession(dec_path, sess_options=sess_opts)
             log.info(f"{label} decoder loaded in {(time.monotonic()-t0)*1000:.0f}ms")
-
-    @property
-    def is_ready(self) -> bool:
-        return self._ready.is_set()
-
-    @property
-    def is_failed(self) -> bool:
-        return self._failed
 
     def apply(
         self,
@@ -260,10 +222,7 @@ class ToneEngine:
             log.info(f"ToneEngine cache HIT | persona={_PERSONA_DEFS[persona_idx][0]}")
             return cached
 
-        if not self._load_called:
-            raise RuntimeError("ToneEngine.load() was never called.")
-        if not self._ready.wait(timeout=LOAD_TIMEOUT):
-            raise RuntimeError(f"ToneEngine did not finish loading within {LOAD_TIMEOUT}s.")
+        self._wait_ready()
 
         with self._lock:
             cached = self._cache.get(cache_key)

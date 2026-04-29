@@ -1,19 +1,27 @@
-# ── Week 1 — UI & system ──────────────────────────────────────────────────────
+# Smart Keyboard — pinned dependencies
+# Tested on Python 3.10–3.12, Windows 10/11 (64-bit)
+# To recreate the environment:
+#   python -m venv venv
+#   venv\Scripts\activate
+#   pip install -r requirements.txt
+
+# ── UI & system ───────────────────────────────────────────────────────────────
 pynput==1.8.1
 pyperclip==1.11.0
 PyAutoGUI==0.9.54
 PyQt5==5.15.11
+PyQt5-Qt5==5.15.2
+PyQt5_sip==12.18.0
 pystray==0.19.5
 Pillow==10.3.0
 
-# ── Week 2 — Translation pipeline ────────────────────────────────────────────
+# ── AI inference ──────────────────────────────────────────────────────────────
+numpy==2.4.4
 onnxruntime==1.20.1
 onnx==1.17.0
 transformers==4.41.0
 sentencepiece==0.2.0
-sacrebleu==2.4.2        # used in Colab validation only
 indic-transliteration==2.3.82
 
-
-# ── Week 3 — Grammar pipeline ────────────────────────────────────────────────
-# No additional deps — uses the same onnxruntime + transformers stack as Week 2
+# ── Colab / validation only (not required at runtime) ────────────────────────
+sacrebleu==2.4.2

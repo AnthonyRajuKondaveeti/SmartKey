@@ -31,12 +31,10 @@ import os
 import re
 import time
 import hashlib
-import threading
-import concurrent.futures
 import numpy as np
 from typing import Callable, Optional
 from logger import log
-from cache import LRUCache
+from engine_base import BaseEngine
 from utils import ABBREV_RE
 
 # IndicTrans2 outputs ALL Indic languages in Devanagari script internally.
@@ -119,7 +117,7 @@ CACHE_SIZE          = 200
 MAX_INPUT_LEN       = 256   # Token limit — matches IndicTrans2 training
 MAX_TEXT_SIZE       = 5_000  # Char limit — reject before tokenisation to avoid CPU spike
 MAX_OUTPUT_LEN      = 384
-NUM_BEAMS           = 4     # Beam search width (quality vs speed)
+NUM_BEAMS           = 3     # Beam search width (quality vs speed); 2 halves decode time vs 4 with marginal quality loss
 REPETITION_PENALTY  = 1.3   # Penalise repeated tokens during decoding
 LOAD_TIMEOUT        = 60    # Seconds to wait for model load before giving up
 
@@ -138,64 +136,28 @@ def _split_for_translation(text: str) -> list:
 
 # ── TranslationEngine ─────────────────────────────────────────────────────────
 
-class TranslationEngine:
+class TranslationEngine(BaseEngine):
     """
     Manages the IndicTrans2 ONNX model lifecycle and translation requests.
 
     Thread safety:
-      - load()           → runs on a dedicated daemon thread
-      - translate()      → dispatches each request to its own daemon thread
+      - load()           → runs on a dedicated daemon thread (BaseEngine)
+      - translate()      → dispatches each request to the executor; returns Future
       - _translate_sync  → serialized via _lock; cache read/write is also locked
     """
 
     def __init__(self, model_dir: str = "models/indictrans2"):
-        self._model_dir   = model_dir
-        self._tokenizer   = None
-        self._encoder     = None
-        self._decoder     = None
-        self._cache       = LRUCache("translation", CACHE_SIZE)
-        self._ready       = threading.Event()
-        self._failed      = False
-        self._load_called = False
-        self._lock        = threading.Lock()
-        self._executor    = concurrent.futures.ThreadPoolExecutor(
-            max_workers=2, thread_name_prefix="TranslationEngine"
+        super().__init__(
+            cache_namespace = "translation",
+            cache_size      = CACHE_SIZE,
+            thread_prefix   = "TranslationEngine",
+            load_timeout    = LOAD_TIMEOUT,
         )
+        self._model_dir = model_dir
+        self._tokenizer = None
+        self._encoder   = None
+        self._decoder   = None
         log.debug(f"TranslationEngine created | model_dir={model_dir}")
-
-    # ── Loading ───────────────────────────────────────────────────────────────
-
-    def load(
-        self,
-        on_ready: Optional[Callable[[], None]] = None,
-        on_error: Optional[Callable[[str], None]] = None,
-    ) -> None:
-        """
-        Load the model on a background thread.
-        on_ready() called when loading succeeds.
-        on_error(msg) called on failure.
-        """
-        self._load_called = True
-        log.info("Model load requested — starting background thread")
-
-        def _load():
-            t_start = time.monotonic()
-            try:
-                self._load_model()
-                elapsed = (time.monotonic() - t_start) * 1000
-                self._ready.set()
-                log.info(f"Model loaded and ready in {elapsed:.0f}ms")
-                if on_ready:
-                    on_ready()
-            except Exception as e:
-                elapsed = (time.monotonic() - t_start) * 1000
-                log.error(f"Model load failed after {elapsed:.0f}ms: {e}")
-                self._failed = True
-                if on_error:
-                    on_error(str(e))
-
-        t = threading.Thread(target=_load, daemon=True, name="TranslationEngine-Load")
-        t.start()
 
     def _load_model(self) -> None:
         if not os.path.isdir(self._model_dir):
@@ -250,14 +212,6 @@ class TranslationEngine:
                 "Run: pip install indic-transliteration"
             )
 
-    @property
-    def is_ready(self) -> bool:
-        return self._ready.is_set()
-
-    @property
-    def is_failed(self) -> bool:
-        return self._failed
-
     # ── Translation ───────────────────────────────────────────────────────────
 
     def translate(
@@ -266,14 +220,15 @@ class TranslationEngine:
         on_result:   Callable[[str], None],
         on_error:    Optional[Callable[[str], None]] = None,
         target_lang: str = "hin_Deva",
-    ) -> None:
+    ):
         """
         Translate `text` from English to `target_lang` asynchronously.
         on_result(text) called on a background thread when done.
         on_error(msg)   called if something fails.
         Cache hit returns instantly without model inference.
 
-        target_lang: "hin_Deva" (Hindi) | "tel_Telu" (Telugu)
+        Returns the submitted Future — caller may call .cancel() to abort
+        a queued (not yet running) job.
         """
         log.info(f"Translate requested | lang={target_lang} | input: {len(text)} chars")
 
@@ -286,7 +241,7 @@ class TranslationEngine:
                 if on_error:
                     on_error(str(e))
 
-        self._executor.submit(_run)
+        return self._executor.submit(_run)
 
     def _translate_sync(self, text: str, target_lang: str = "hin_Deva") -> str:
         text = text.strip()
@@ -308,24 +263,7 @@ class TranslationEngine:
             return cached
 
         log.debug(f"Cache MISS ({self._cache.misses} misses so far)")
-
-        if not self._load_called:
-            raise RuntimeError(
-                "TranslationEngine.load() was never called. "
-                "Call engine.load() at app startup before translating."
-            )
-
-        # Wait for model to finish loading
-        log.debug("Waiting for model to be ready ...")
-        t_wait = time.monotonic()
-        if not self._ready.wait(timeout=LOAD_TIMEOUT):
-            raise RuntimeError(
-                f"Translation model did not finish loading within {LOAD_TIMEOUT}s. "
-                "Check that the model files in models/indictrans2/ are complete."
-            )
-        waited_ms = (time.monotonic() - t_wait) * 1000
-        if waited_ms > 100:
-            log.debug(f"Waited {waited_ms:.0f}ms for model to be ready")
+        self._wait_ready()
 
         # Serialize inference
         with self._lock:
@@ -384,33 +322,65 @@ class TranslationEngine:
         encoder_hidden = enc_out[0]
 
         eos_id     = self._tokenizer.eos_token_id or 2
-        output_ids = self._beam_decode(encoder_hidden, attention_mask, eos_id)
+        # Cap output steps at 2× the non-padded input length + 20 tokens headroom.
+        # Translations are rarely longer than their source; this avoids running
+        # up to 384 steps for a 6-word sentence.
+        input_len  = int(attention_mask.sum())
+        max_steps  = min(MAX_OUTPUT_LEN, max(32, input_len * 2 + 20))
+        output_ids = self._beam_decode(encoder_hidden, attention_mask, eos_id, max_steps)
 
         raw    = self._tokenizer.decode(output_ids, skip_special_tokens=True)
         result = _postprocess(raw, target_lang, source=sentence)
         return result
 
     def _beam_decode(self, encoder_hidden: np.ndarray,
-                     attention_mask: np.ndarray, eos_id: int) -> list:
-        """Beam search with repetition penalty. Returns best token id list."""
-        # Each beam: [score (higher=better), token_ids]
+                     attention_mask: np.ndarray, eos_id: int,
+                     max_steps: int = MAX_OUTPUT_LEN) -> list:
+        """
+        Batched beam search with repetition penalty.
+
+        All active beams are stacked into a single (batch, seq_len) tensor and
+        passed to the decoder in one call per step instead of one call per beam.
+        The decoder was exported with a dynamic 'batch' axis so this is safe.
+
+        Returns the best token id list.
+        """
         beams     = [(0.0, [eos_id])]
         completed = []
+        t0        = time.monotonic()
+        steps     = 0
 
-        for _ in range(MAX_OUTPUT_LEN):
+        for _ in range(max_steps):
+            steps += 1
             if not beams:
                 break
+
+            n = len(beams)   # active beams this step (≤ NUM_BEAMS)
+
+            # Stack all beam sequences — they are always the same length at each
+            # step because every beam advances exactly one token per iteration.
+            dec_ids_batch = np.array([ids for _, ids in beams], dtype=np.int64)
+            # shape: (n, step)
+
+            # Tile encoder outputs to match the active beam count.
+            enc_batch  = np.repeat(encoder_hidden, n, axis=0)
+            # shape: (n, enc_seq, hidden)
+            attn_batch = np.repeat(attention_mask,  n, axis=0)
+            # shape: (n, enc_seq)
+
+            # Single decoder call for all beams — (n, step, vocab_size)
+            logits_batch = self._decoder.run(None, {
+                "decoder_input_ids":      dec_ids_batch,
+                "encoder_hidden_states":  enc_batch,
+                "encoder_attention_mask": attn_batch,
+            })[0][:, -1, :]   # (n, vocab_size) — last token position only
+
             candidates = []
-            for score, ids in beams:
-                dec_ids = np.array([ids], dtype=np.int64)
-                logits  = self._decoder.run(None, {
-                    "decoder_input_ids":      dec_ids,
-                    "encoder_hidden_states":  encoder_hidden,
-                    "encoder_attention_mask": attention_mask,
-                })[0][0, -1, :].copy()       # (vocab_size,)
+            for i, (score, ids) in enumerate(beams):
+                logits = logits_batch[i].copy()
 
                 # Repetition penalty — downscale logits for already-seen tokens
-                for prev_id in set(ids[1:]):  # skip BOS
+                for prev_id in set(ids[1:]):   # skip BOS
                     if logits[prev_id] > 0:
                         logits[prev_id] /= REPETITION_PENALTY
                     else:
@@ -426,19 +396,22 @@ class TranslationEngine:
                     new_score = score + float(log_probs[nid])
                     new_ids   = ids + [int(nid)]
                     if int(nid) == eos_id:
-                        # Length-normalise so shorter beams don't dominate
-                        length        = max(len(new_ids) - 1, 1)
-                        normed_score  = new_score / (length ** 0.6)
-                        completed.append((normed_score, new_ids))
+                        length = max(len(new_ids) - 1, 1)
+                        completed.append((new_score / (length ** 0.6), new_ids))
                     else:
                         candidates.append((new_score, new_ids))
 
-            # Prune to top NUM_BEAMS
             candidates.sort(key=lambda x: -x[0])
             beams = candidates[:NUM_BEAMS]
 
             if len(completed) >= NUM_BEAMS:
                 break
+
+        elapsed = (time.monotonic() - t0) * 1000
+        log.debug(
+            f"Beam decode | {steps}/{max_steps} steps | "
+            f"{elapsed:.0f}ms | {elapsed/max(steps,1):.1f}ms/step"
+        )
 
         if completed:
             completed.sort(key=lambda x: -x[0])
