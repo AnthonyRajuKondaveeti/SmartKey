@@ -116,11 +116,6 @@ C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -Command ^
     "Get-ChildItem 'dist\SmartKeyboard\_internal\PyQt5' -Filter *.pyi | Remove-Item -Force"
 echo       Removed PyQt5 .pyi type stubs
 
-:: dist-info directories -- package metadata, not needed at runtime
-C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -Command ^
-    "Get-ChildItem 'dist\SmartKeyboard\_internal' -Filter '*dist-info' -Directory | Remove-Item -Recurse -Force"
-echo       Removed dist-info directories
-
 echo       Cleanup done.
 
 :: ── 4. Copy required AI models into the dist folder ─────────────────────────
