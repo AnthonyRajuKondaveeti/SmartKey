@@ -255,6 +255,8 @@ popup.closeEvent()
 smart-keyboard/
 ├── app/
 │   ├── main.py              # Entry point; wires all components; single-instance lock
+│   ├── engine_base.py       # Shared base class for all AI engines
+│   ├── setup_wizard.py      # First-run model file check dialog
 │   ├── hotkey_listener.py   # Global hotkey via pynput; bounded trigger queue
 │   ├── hotkey_dialog.py     # Settings dialog (hotkey recorder + language + automate)
 │   ├── popup.py             # Floating UI (PyQt5); circle minimise; history deque
@@ -268,7 +270,8 @@ smart-keyboard/
 │   ├── version.py           # __version__ string
 │   └── logger.py            # Rotating file + console logging
 ├── scripts/
-│   └── convert_translation_model.py   # Export IndicTrans2 → ONNX (Colab)
+│   ├── SmartKeyboard_IndicTrans2_Convert_8lang.ipynb  # Export IndicTrans2 → ONNX (Colab, 8 languages)
+│   └── IndicBART_Hindi_LORA.ipynb                     # IndicBART LoRA fine-tuning for tone personas
 ├── models/                  # Not included — download separately (see Model Setup)
 │   ├── indictrans2/
 │   ├── grammar/
@@ -276,7 +279,10 @@ smart-keyboard/
 │   │   └── visheratin-tiny_int8/
 │   └── tone/hin/
 ├── requirements.txt
-├── smart_keyboard.spec      # PyInstaller build spec
+├── smart_keyboard.spec      # PyInstaller build spec (optimised — strips unused packages)
+├── build_release.bat        # One-click build → clean → package script
+├── installer.iss            # Inno Setup script for Windows installer (.exe)
+├── UserManual.txt           # End-user guide included in every distribution
 └── README.md
 ```
 
@@ -449,23 +455,46 @@ Settings are stored in `%APPDATA%\SmartKeyboard\settings.json` and written autom
 
 ## Building an Executable
 
-```bash
-# With venv active, from the project root
-pyinstaller smart_keyboard.spec
+### For distribution (recommended)
+
+`build_release.bat` handles everything in one step — rebuild, strip bloat, copy models, create ZIP, and optionally compile the Inno Setup installer if it is installed.
+
+```bat
+build_release.bat
 ```
 
-Output: `dist/SmartKeyboard/SmartKeyboard.exe` (directory bundle, no console window)
+Output:
+- `dist/SmartKeyboard/` — standalone directory bundle
+- `dist/SmartKeyboard-v1.0.0-win64.zip` — share this with users (extract and run)
+- `dist/SmartKeyboard-v1.0.0-Setup.exe` — proper Windows installer (if Inno Setup 6 is installed)
 
-After building, copy model directories into the bundle:
+Only two model directories are bundled for distribution:
 
 ```
 dist/SmartKeyboard/models/indictrans2/
 dist/SmartKeyboard/models/grammar/coedit-small_int8/
-dist/SmartKeyboard/models/grammar/visheratin-tiny_int8/
-dist/SmartKeyboard/models/tone/hin/
 ```
 
-The spec excludes PyTorch, TensorFlow, scipy, sklearn, pandas, and matplotlib. UPX compression is enabled (~30% size reduction on the Python internals).
+`decoder_with_past_model.onnx` is excluded from the grammar model (53 MB, not used at runtime).
+
+### Manual build
+
+```bash
+# With venv active, from the project root
+pyinstaller smart_keyboard.spec --clean -y
+```
+
+The spec strips: PyTorch, TensorFlow, lxml, safetensors, onnx (not onnxruntime), tkinter, Qt translations, Qt QML runtime, unused transformers model architecture files, and PyQt5 type stubs. UPX compression is enabled (~30% reduction on Python internals).
+
+### Windows installer
+
+Requires [Inno Setup 6](https://jrsoftware.org/isdl.php) (free). After `build_release.bat` has run:
+
+```powershell
+& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+```
+
+The installer places files in `%ProgramFiles%\Smart Keyboard`, creates Start Menu and optional Desktop shortcuts, and registers an uninstaller in Add or Remove Programs.
 
 ---
 
@@ -661,6 +690,18 @@ Frameless `Qt.Tool | Qt.WindowStaysOnTopHint` window with `WA_ShowWithoutActivat
 ```
 
 The output box uses **Nirmala UI** font (ships with Windows 8+) to correctly render all 8 supported Indic scripts without OpenType fallback warnings.
+
+---
+
+### `app/engine_base.py`
+
+Shared base class inherited by `TranslationEngine`, `GrammarEngine`, and `ToneEngine`. Provides common `load()` scaffolding with background thread management and `on_ready` / `on_error` callbacks.
+
+---
+
+### `app/setup_wizard.py` — `run_setup_if_needed()`
+
+Blocking first-run dialog that checks for required ONNX model files before any engine loads. If files are missing it lists each missing path and lets the user either exit or continue in degraded mode. Called once from `main.py` after `QApplication` is created but before `exec_()`.
 
 ---
 
